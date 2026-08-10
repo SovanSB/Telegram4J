@@ -16,11 +16,13 @@
 package telegram4j.mtproto.auth;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
+import io.netty.buffer.Unpooled;
+import telegram4j.tl.api.TlEncodingUtil;
 
 import java.math.BigInteger;
 import java.util.Objects;
 
-import static telegram4j.mtproto.util.CryptoUtil.fromByteBuf;
 import static telegram4j.mtproto.util.CryptoUtil.random;
 
 /**
@@ -52,18 +54,22 @@ public final class DhParameters {
     /**
      * Validates the given parameters and creates a holder for them.
      *
-     * @param primeData the {@code dh_prime} as received from the server.
+     * @param data the {@code dh_prime} as received from the server; copied, not retained.
      * @param g the generator, always one of 2, 3, 4, 5, 6 or 7.
      * @param checker the cache of already verified primes; a prime absent from it is verified
      * and the outcome is remembered.
      * @throws AuthorizationException if any of the checks fails.
      * @return The validated parameters.
      */
-    public static DhParameters create(ByteBuf primeData, int g, DhPrimeChecker checker) {
-        Objects.requireNonNull(primeData);
+    public static DhParameters create(ByteBuf data, int g, DhPrimeChecker checker) {
+        Objects.requireNonNull(data);
         Objects.requireNonNull(checker);
 
-        BigInteger prime = fromByteBuf(primeData);
+        // an instance outlives the request its prime arrived in, notably for secret chats,
+        // where the same parameters are reused for every chat until the server bumps the version
+        ByteBuf primeData = TlEncodingUtil.copyAsUnpooled(data);
+
+        BigInteger prime = new BigInteger(1, ByteBufUtil.getBytes(primeData));
         if (prime.bitLength() != 2048) {
             throw new AuthorizationException("dhPrime is not 2048-bit number");
         }
@@ -159,6 +165,35 @@ public final class DhParameters {
     /** {@return {@code peerPublicKey^secret mod dh_prime}} */
     public BigInteger computeSharedKey(BigInteger peerPublicKey, BigInteger secret) {
         return peerPublicKey.modPow(secret, prime);
+    }
+
+    /**
+     * Computes the shared key as exactly {@value #KEY_SIZE} big-endian bytes.
+     *
+     * <p> The result of the exponentiation is just a number, and roughly one in 256 of them is
+     * shorter than {@value #KEY_SIZE} bytes. Left-padding it with zeros is what every
+     * implementation does and what no specification mentions; without it the key fingerprint and
+     * every derivation offset silently shift, in a way that only shows up on the occasional
+     * connection.
+     *
+     * @return The shared key, which the caller owns.
+     */
+    public ByteBuf computeSharedKeyData(BigInteger peerPublicKey, BigInteger secret) {
+        return toFixedWidth(computeSharedKey(peerPublicKey, secret), KEY_SIZE);
+    }
+
+    static ByteBuf toFixedWidth(BigInteger value, int size) {
+        byte[] data = value.toByteArray();
+        // toByteArray() prepends a zero byte when the top bit of the magnitude is set
+        int offset = data[0] == 0 ? 1 : 0;
+        int length = data.length - offset;
+        if (length > size) {
+            throw new IllegalArgumentException("Value is wider than " + size + " bytes: " + length);
+        }
+
+        return Unpooled.buffer(size, size)
+                .writeZero(size - length)
+                .writeBytes(data, offset, length);
     }
 
     /**

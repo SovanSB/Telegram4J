@@ -283,10 +283,8 @@ final class Handshake extends ChannelInboundHandlerAdapter {
         dh.checkPublicKey(ga, "gA");
         dh.checkPublicKey(gb, "gB");
 
-        BigInteger authKey = dh.computeSharedKey(ga, b);
-
         context.serverTimeDiff(serverDHInnerData.serverTime() - Math.toIntExact(System.currentTimeMillis()/1000));
-        context.authKey(toByteBuf(authKey));
+        context.authKey(dh.computeSharedKeyData(ga, b));
         context.authKeyHash(sha1Digest(context.authKey()).slice(0, 8));
         context.serverSalt(Long.reverseBytes(context.newNonce().getLong(0) ^ context.serverNonce().getLong(1)));
 
