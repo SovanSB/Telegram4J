@@ -68,12 +68,13 @@ public final class SecretChatCipher {
 
         int objectSize = SecretTlSerializer.sizeOf(object);
         int dataSize = Integer.BYTES + objectSize;
-        int paddingSize = paddedSize(dataSize) - dataSize;
+        int paddedSize = paddedSize(dataSize);
+        int paddingSize = paddedSize - dataSize;
 
         byte[] paddingBytes = new byte[paddingSize];
         random.nextBytes(paddingBytes);
 
-        ByteBuf plainText = alloc.buffer(dataSize + paddingSize);
+        ByteBuf plainText = alloc.buffer(paddedSize);
         plainText.writeIntLE(objectSize);
         SecretTlSerializer.serialize(plainText, object);
         plainText.writeBytes(paddingBytes);

@@ -35,6 +35,7 @@ import static telegram4j.mtproto.util.CryptoUtil.random;
 public final class DhParameters {
     /** Size of the private exponents and of the resulting shared key, in bytes. */
     public static final int KEY_SIZE = 256;
+    public static final int DEFAULT_CERTAINTY = 64;
 
     private static final BigInteger SAFETY_RANGE = BigInteger.TWO.pow(2048 - 64);
 
@@ -109,13 +110,13 @@ public final class DhParameters {
                 // And inlined as `num.bitLength() > 2048 ? 128 : 64`
                 // But received dhPrime is a safe 2048-bit number
                 // https://github.com/tdlib/td/blob/cf1984844be7ec0c06762d8d617cbb20352ec9a2/tdutils/td/utils/BigNum.cpp#L150-#L159
-                if (!prime.isProbablePrime(64)) {
+                if (!prime.isProbablePrime(DEFAULT_CERTAINTY)) {
                     checker.addBadPrime(primeData);
                     throw new AuthorizationException("dhPrime is not a prime number");
                 }
 
                 BigInteger halfDhPrime = prime.subtract(BigInteger.ONE).divide(BigInteger.TWO);
-                if (!halfDhPrime.isProbablePrime(64)) {
+                if (!halfDhPrime.isProbablePrime(DEFAULT_CERTAINTY)) {
                     checker.addBadPrime(primeData);
                     throw new AuthorizationException("(dhPrime - 1) / 2 is not a prime number");
                 }
