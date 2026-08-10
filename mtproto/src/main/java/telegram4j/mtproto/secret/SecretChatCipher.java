@@ -24,6 +24,7 @@ import telegram4j.tl.SecretTlDeserializer;
 import telegram4j.tl.SecretTlSerializer;
 import telegram4j.tl.api.SecretObject;
 
+import static telegram4j.mtproto.internal.Crypto.sha1Digest;
 import static telegram4j.mtproto.internal.Crypto.sha256Digest;
 import static telegram4j.mtproto.util.CryptoUtil.random;
 
@@ -35,8 +36,10 @@ import static telegram4j.mtproto.util.CryptoUtil.random;
  * authorization key, and the {@code x} offset of the key derivation is chosen by which side
  * created the chat instead of by the direction of the packet.
  *
- * <p> MTProto 1.0, which used SHA-1 and is what secret chats looked like before layer 73,
- * is not implemented in either direction.
+ * <p> MTProto 1.0, which used SHA-1 and is what secret chats looked like before layer 73, is
+ * never written. It is only read when {@linkplain #SecretChatCipher(boolean) explicitly
+ * allowed}, since accepting it lets a peer downgrade the chat to a construction whose message
+ * key is a plain hash of the plaintext and involves the key nowhere.
  *
  * @implNote Instances are stateful and not thread safe, exactly like {@link AES256IGECipher}.
  * @see <a href="https://core.telegram.org/api/end-to-end">End-to-End Encryption, Secret Chats</a>
@@ -46,6 +49,8 @@ public final class SecretChatCipher {
     private static final int HEADER_SIZE = 8 + 16;
     private static final int MIN_PADDING = 12;
     private static final int MAX_PADDING = 1024;
+    /** MTProto 1.0 aligned to 16 bytes and nothing more. */
+    private static final int MAX_LEGACY_PADDING = 15;
 
     // Padding is not merely an alignment: rounding the encrypted size up to one of these
     // buckets is what hides the exact length of short messages. Taken from TDLib's
@@ -54,6 +59,31 @@ public final class SecretChatCipher {
     private static final int PADDING_STEP = 448;
 
     private final AES256IGECipher cipher = AES256IGECipher.create();
+    private final boolean acceptLegacy;
+
+    /** Creates a cipher which reads and writes MTProto 2.0 only. */
+    public SecretChatCipher() {
+        this(false);
+    }
+
+    /**
+     * Creates a cipher which may additionally read MTProto 1.0.
+     *
+     * <p> Needed to talk to peers which open a chat in MTProto 1.0 and only switch after
+     * learning that we support layer 73, MadelineProto among them. Their first service message
+     * is unreadable without this, and because such clients answer a resend request by replaying
+     * the stored ciphertext rather than re-encrypting it, the resulting hole in the sequence
+     * numbers never gets filled and the chat stops before it starts.
+     *
+     * <p> The cost is that a peer can present any message as MTProto 1.0, whose message key is
+     * {@code SHA1(plaintext)} and therefore proves only that the sender knew the plaintext, not
+     * that they knew the key. Leave this off unless such peers are expected.
+     *
+     * @param acceptLegacy whether incoming MTProto 1.0 payloads are accepted.
+     */
+    public SecretChatCipher(boolean acceptLegacy) {
+        this.acceptLegacy = acceptLegacy;
+    }
 
     /**
      * Encrypts the given object into the payload of a {@code messages.sendEncrypted*} request.
@@ -123,6 +153,17 @@ public final class SecretChatCipher {
             throw new SecretChatException("Payload has no encrypted part");
         }
 
+        try {
+            return decryptV2(key, creator, messageKey, body);
+        } catch (SecretChatException e) {
+            if (!acceptLegacy) {
+                throw e;
+            }
+            return decryptV1(key, messageKey, body);
+        }
+    }
+
+    private SecretObject decryptV2(AuthKey key, boolean creator, ByteBuf messageKey, ByteBuf body) {
         // Unlike outgoing messages, the offset here is the one of the *other* side
         int x = creator ? 8 : 0;
 
@@ -137,17 +178,8 @@ public final class SecretChatCipher {
                 throw new SecretChatException("Message key mismatch");
             }
 
-            int objectSize = decrypted.readIntLE();
-            int tailSize = decrypted.readableBytes();
-            if (objectSize < 0 || objectSize % 4 != 0) {
-                throw new SecretChatException("Invalid object length: " + objectSize);
-            }
-            if (objectSize > tailSize) {
-                throw new SecretChatException("Object length is bigger than the payload: "
-                        + objectSize + " > " + tailSize);
-            }
-
-            int paddingSize = tailSize - objectSize;
+            int objectSize = readObjectSize(decrypted);
+            int paddingSize = decrypted.readableBytes() - objectSize;
             if (paddingSize < MIN_PADDING || paddingSize > MAX_PADDING) {
                 throw new SecretChatException("Invalid padding length: " + paddingSize);
             }
@@ -156,6 +188,49 @@ public final class SecretChatCipher {
         } finally {
             decrypted.release();
         }
+    }
+
+    // MTProto 1.0 derives both the keys and the message key with SHA-1, and uses the same
+    // offset in both directions, so nothing here depends on who created the chat
+    private SecretObject decryptV1(AuthKey key, ByteBuf messageKey, ByteBuf body) {
+        initLegacyCipher(key, messageKey);
+        ByteBuf decrypted = cipher.decrypt(body.retain());
+
+        try {
+            int objectSize = readObjectSize(decrypted);
+            int paddingSize = decrypted.readableBytes() - objectSize;
+            if (paddingSize > MAX_LEGACY_PADDING) {
+                throw new SecretChatException("Invalid legacy padding length: " + paddingSize);
+            }
+
+            // the hash covers the length prefix and the object, but not the padding
+            ByteBuf sha1 = sha1Digest(decrypted.slice(0, Integer.BYTES + objectSize));
+            boolean matches = equalsConstantTime(messageKey, sha1.slice(4, 16));
+            sha1.release();
+            if (!matches) {
+                throw new SecretChatException("Legacy message key mismatch");
+            }
+
+            return SecretTlDeserializer.deserialize(decrypted.slice(decrypted.readerIndex(), objectSize));
+        } finally {
+            decrypted.release();
+        }
+    }
+
+    private static int readObjectSize(ByteBuf decrypted) {
+        if (decrypted.readableBytes() % 16 != 0) {
+            throw new SecretChatException("Decrypted data is not divisible by 16");
+        }
+
+        int objectSize = decrypted.readIntLE();
+        if (objectSize < 0 || objectSize % 4 != 0) {
+            throw new SecretChatException("Invalid object length: " + objectSize);
+        }
+        if (objectSize > decrypted.readableBytes()) {
+            throw new SecretChatException("Object length is bigger than the payload: "
+                    + objectSize + " > " + decrypted.readableBytes());
+        }
+        return objectSize;
     }
 
     // msg_key_large = SHA256(substr(key, 88 + x, 32) + plaintext); msg_key = substr(msg_key_large, 8, 16)
@@ -186,6 +261,32 @@ public final class SecretChatCipher {
 
         // init() releases aesKey, and the iv is released by the following encrypt()/decrypt()
         cipher.init(encrypt, aesKey, aesIV);
+    }
+
+    private void initLegacyCipher(AuthKey key, ByteBuf messageKey) {
+        ByteBuf value = key.value();
+
+        ByteBuf sha1a = sha1Digest(messageKey, value.slice(0, 32));
+        ByteBuf sha1b = sha1Digest(value.slice(32, 16), messageKey, value.slice(48, 16));
+        ByteBuf sha1c = sha1Digest(value.slice(64, 32), messageKey);
+        ByteBuf sha1d = sha1Digest(messageKey, value.slice(96, 32));
+
+        ByteBuf aesKey = Unpooled.wrappedBuffer(
+                sha1a.retainedSlice(0, 8),
+                sha1b.retainedSlice(8, 12),
+                sha1c.retainedSlice(4, 12));
+
+        ByteBuf aesIV = Unpooled.wrappedBuffer(
+                sha1a.retainedSlice(8, 12),
+                sha1b.retainedSlice(0, 8),
+                sha1c.retainedSlice(16, 4),
+                sha1d.retainedSlice(0, 8));
+        sha1a.release();
+        sha1b.release();
+        sha1c.release();
+        sha1d.release();
+
+        cipher.init(false, aesKey, aesIV);
     }
 
     static int paddedSize(int dataSize) {

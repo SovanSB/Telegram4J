@@ -128,6 +128,46 @@ class SecretChatCipherTest {
     }
 
     @Test
+    void readsLegacyPayloadOnlyWhenAllowed() {
+        // An MTProto 1.0 payload for `key` and layer("hi", 0, 1), built from MadelineProto's
+        // Crypt::oldKdf and tryMTProtoV1Decrypt. This is what MadelineProto's first service
+        // message in a chat looks like, before it learns that the peer supports layer 73
+        ByteBuf payload = Unpooled.wrappedBuffer(ByteBufUtil.decodeHexDump(
+                "ec1fdd87a222d431b403e96c23d0f6e1581bc16bd0cd25e200ad21dd121f8b6b" +
+                "6164e46b5cc7bfc00fb098ba90f9435c7a22745c0d66123276c3db954a1330ce" +
+                "ad1125770f0541e139636e8d55dfe2d965ccd2f87c7a1283"));
+
+        var strict = new SecretChatCipher();
+        assertThrowsExactly(SecretChatException.class, () -> strict.decrypt(key, false, payload));
+
+        var lenient = new SecretChatCipher(true);
+        assertEquals(layer("hi", 0, 1), lenient.decrypt(key, false, payload));
+        payload.release();
+    }
+
+    @Test
+    void legacyModeStillRejectsGarbage() {
+        // falling back to MTProto 1.0 must not turn a bad payload into a parsed one
+        var lenient = new SecretChatCipher(true);
+
+        ByteBuf payload = lenient.encrypt(key, true, layer("hi", 0, 1));
+        payload.setByte(payload.writerIndex() - 1, payload.getByte(payload.writerIndex() - 1) ^ 1);
+
+        assertThrowsExactly(SecretChatException.class, () -> lenient.decrypt(key, false, payload));
+        payload.release();
+    }
+
+    @Test
+    void neverWritesLegacy() {
+        // the compatibility mode is read-only: what we send stays MTProto 2.0
+        var lenient = new SecretChatCipher(true);
+
+        ByteBuf payload = lenient.encrypt(key, true, layer("hi", 0, 1));
+        assertEquals(layer("hi", 0, 1), new SecretChatCipher().decrypt(key, false, payload));
+        payload.release();
+    }
+
+    @Test
     void survivesArbitraryLengths() {
         var creator = new SecretChatCipher();
         var participant = new SecretChatCipher();
