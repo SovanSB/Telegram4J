@@ -162,6 +162,21 @@ public final class DhParameters {
         return g.modPow(secret, prime);
     }
 
+    /**
+     * Computes our public key as exactly {@value #KEY_SIZE} big-endian bytes, after checking it.
+     *
+     * <p> Leading zeros are harmless on the wire, where the value is read as an integer, and
+     * padding keeps the size of the field from varying with the key.
+     *
+     * @throws AuthorizationException if the resulting key is out of bounds or out of safety range.
+     * @return The public key, which the caller owns.
+     */
+    public ByteBuf computePublicKeyData(BigInteger secret) {
+        BigInteger publicKey = computePublicKey(secret);
+        checkPublicKey(publicKey, "g_b");
+        return toFixedWidth(publicKey, KEY_SIZE);
+    }
+
     /** {@return {@code peerPublicKey^secret mod dh_prime}} */
     public BigInteger computeSharedKey(BigInteger peerPublicKey, BigInteger secret) {
         return peerPublicKey.modPow(secret, prime);

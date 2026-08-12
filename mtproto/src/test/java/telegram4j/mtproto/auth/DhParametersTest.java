@@ -25,20 +25,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class DhParametersTest {
 
-    // The 2048-bit safe prime Telegram has been returning for years, with g = 3
-    static final String DH_PRIME =
-            "c71caeb9c6b1c9048e6c522f70f13f73980d40238e3e21c14934d037563d930f" +
-            "48198a0aa7c14058229493d22530f4dbfa336f6e0ac925139543aed44cce7c37" +
-            "20fd51f69458705ac68cd4fe6b6b13abdc9746512969328454f18faf8c595f64" +
-            "2477fe96bb2a941d5bcd1d4ac8cc49880708fa9b378e3c4f3a9060bee67cf9a4" +
-            "a4a695811051907e162753b56b0f6b410dba74d8a84b2a14b3144e0ef1284754" +
-            "fd17ed950d5965b4b9dd46582db1178d169c6bc465b0d6ff9ca3928fef5b9ae4" +
-            "e418fc15e83ebea0f87fa9ff5eed70050ded2849f47bf959d956850ce929851f" +
-            "0d8115f635b105ee2e4e15d04b2454bf6f4fadf034b10403119cd8e3b92fcc5b";
-
     static DhParameters params() {
-        return DhParameters.create(Unpooled.wrappedBuffer(ByteBufUtil.decodeHexDump(DH_PRIME)),
-                3, DhPrimeCheckerCache.instance());
+        return TestDhParameters.create();
     }
 
     @Test
@@ -97,7 +85,7 @@ class DhParametersTest {
 
     @Test
     void rejectsBadGenerator() {
-        var prime = Unpooled.wrappedBuffer(ByteBufUtil.decodeHexDump(DH_PRIME));
+        var prime = Unpooled.wrappedBuffer(ByteBufUtil.decodeHexDump(TestDhParameters.PRIME));
         var checker = DhPrimeCheckerCache.instance();
 
         // g = 2 requires p mod 8 == 7, which this prime does not satisfy
