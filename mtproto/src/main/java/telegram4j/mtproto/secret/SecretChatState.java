@@ -20,6 +20,7 @@ import telegram4j.mtproto.auth.AuthKey;
 
 import java.math.BigInteger;
 import java.time.Instant;
+import java.util.Objects;
 
 /**
  * Everything about one secret chat that must outlive the process.
@@ -29,8 +30,12 @@ import java.time.Instant;
  * than losing all of it: a chat whose key survived but whose {@link #seqNo() counters} did not
  * will be discarded by the peer as soon as it speaks.
  *
- * @implNote Instances are mutable and not thread safe. All access to one chat is expected to be
- * serialized, as it is in the reference implementations, where a chat is owned by a single actor.
+ * <p> Instances are immutable, and a change is a new instance built with {@link #toBuilder()}.
+ * A store may therefore hand out what it holds without copying, and a caller that fails to
+ * persist a change leaves the stored state as it was rather than half-applied. That matters here
+ * more than usual: the ordering this class exists to support is that a sequence number is durable
+ * before the message carrying it is sent, and a state mutated in place would already have moved
+ * on before the write was even attempted.
  */
 public final class SecretChatState {
 
@@ -59,30 +64,49 @@ public final class SecretChatState {
     private final int id;
     private final long accessHash;
     private final long peerId;
-    private final boolean creator;
-
-    private Status status;
+    private final Status status;
     @Nullable
-    private BigInteger secret;
+    private final BigInteger secret;
     @Nullable
-    private AuthKey key;
+    private final AuthKey key;
     @Nullable
-    private AuthKey oldKey;
-    private Instant keyCreatedAt;
-    private int remainingMessages = DEFAULT_MESSAGES_PER_KEY;
-    private int layer = DEFAULT_LAYER;
-    private int ttl;
+    private final AuthKey oldKey;
+    @Nullable
+    private final Instant keyCreatedAt;
+    private final int remainingMessages;
+    private final int layer;
+    private final int ttl;
     private final SeqNoState seqNo;
-    private RekeyState rekey = RekeyState.idle();
+    private final RekeyState rekey;
 
-    public SecretChatState(int id, long accessHash, long peerId, boolean creator,
-                           Status status, SeqNoState seqNo) {
-        this.id = id;
-        this.accessHash = accessHash;
-        this.peerId = peerId;
-        this.creator = creator;
-        this.status = status;
-        this.seqNo = seqNo;
+    private SecretChatState(Builder builder) {
+        this.id = builder.id;
+        this.accessHash = builder.accessHash;
+        this.peerId = builder.peerId;
+        this.status = Objects.requireNonNull(builder.status, "status");
+        this.secret = builder.secret;
+        this.key = builder.key;
+        this.oldKey = builder.oldKey;
+        this.keyCreatedAt = builder.keyCreatedAt;
+        this.remainingMessages = builder.remainingMessages;
+        this.layer = builder.layer;
+        this.ttl = builder.ttl;
+        this.seqNo = Objects.requireNonNull(builder.seqNo, "seqNo");
+        this.rekey = builder.rekey;
+    }
+
+    /**
+     * Starts a new chat.
+     *
+     * @param creator whether the chat was created by us, i.e. whether we are its {@code admin_id}.
+     */
+    public static Builder builder(int id, long accessHash, long peerId, boolean creator) {
+        return new Builder(id, accessHash, peerId, creator);
+    }
+
+    /** {@return A builder holding this state, for deriving the next one} */
+    public Builder toBuilder() {
+        return new Builder(this);
     }
 
     /** {@return The {@code chat_id}, unique per account} */
@@ -103,19 +127,14 @@ public final class SecretChatState {
      * {@return Whether this chat was created by us}
      *
      * <p> Decides the parity of the {@linkplain SeqNoState sequence numbers} and the offset of
-     * the key derivation, so it must be persisted rather than recomputed: it is not derivable
-     * from the state alone once the {@code admin_id} is no longer at hand.
+     * the key derivation, and is held by the counters because they are what it governs.
      */
     public boolean creator() {
-        return creator;
+        return seqNo.creator();
     }
 
     public Status status() {
         return status;
-    }
-
-    public void status(Status status) {
-        this.status = status;
     }
 
     /** {@return Our private exponent, while the chat is {@link Status#REQUESTED}} */
@@ -124,33 +143,10 @@ public final class SecretChatState {
         return secret;
     }
 
-    public void secret(@Nullable BigInteger secret) {
-        this.secret = secret;
-    }
-
     /** {@return The negotiated key, once the chat is {@link Status#READY}} */
     @Nullable
     public AuthKey key() {
         return key;
-    }
-
-    /**
-     * Installs a newly negotiated key, keeping the previous one, and restarts the counters which
-     * decide when to replace it again.
-     *
-     * <p> The old key is kept because a replacement is not instantaneous: messages the peer sent
-     * before it processed our commit are still encrypted with it, and arrive after.
-     *
-     * <p> The private exponent is dropped here: it exists only to reach this point, and keeping
-     * it afterwards would leave the material to re-derive the key sitting in storage for the
-     * lifetime of the chat.
-     */
-    public void key(AuthKey key, Instant createdAt) {
-        this.oldKey = this.key;
-        this.key = key;
-        this.keyCreatedAt = createdAt;
-        this.remainingMessages = DEFAULT_MESSAGES_PER_KEY;
-        this.secret = null;
     }
 
     /** {@return The key replaced by the last rekey, still accepted for messages already in flight} */
@@ -159,11 +155,7 @@ public final class SecretChatState {
         return oldKey;
     }
 
-    /** Sets the previous key, or clears it once the peer is known to have moved on. */
-    public void oldKey(@Nullable AuthKey oldKey) {
-        this.oldKey = oldKey;
-    }
-
+    @Nullable
     public Instant keyCreatedAt() {
         return keyCreatedAt;
     }
@@ -171,10 +163,6 @@ public final class SecretChatState {
     /** {@return How many more messages this key may carry before it must be replaced} */
     public int remainingMessages() {
         return remainingMessages;
-    }
-
-    public void remainingMessages(int remainingMessages) {
-        this.remainingMessages = remainingMessages;
     }
 
     /**
@@ -188,17 +176,9 @@ public final class SecretChatState {
         return layer;
     }
 
-    public void layer(int layer) {
-        this.layer = layer;
-    }
-
     /** {@return The self-destruct timer of new messages, in seconds, or zero when disabled} */
     public int ttl() {
         return ttl;
-    }
-
-    public void ttl(int ttl) {
-        this.ttl = ttl;
     }
 
     public SeqNoState seqNo() {
@@ -209,13 +189,126 @@ public final class SecretChatState {
         return rekey;
     }
 
-    public void rekey(RekeyState rekey) {
-        this.rekey = rekey;
-    }
-
     @Override
     public String toString() {
-        return "SecretChatState{id=" + id + ", status=" + status + ", creator=" + creator +
+        return "SecretChatState{id=" + id + ", status=" + status + ", creator=" + creator() +
                 ", layer=" + layer + ", " + seqNo + '}';
+    }
+
+    /** Collects the changes that make up the next state of a chat. */
+    public static final class Builder {
+        private final int id;
+        private final long accessHash;
+        private final long peerId;
+
+        private Status status = Status.REQUESTED;
+        @Nullable
+        private BigInteger secret;
+        @Nullable
+        private AuthKey key;
+        @Nullable
+        private AuthKey oldKey;
+        @Nullable
+        private Instant keyCreatedAt;
+        private int remainingMessages = DEFAULT_MESSAGES_PER_KEY;
+        private int layer = DEFAULT_LAYER;
+        private int ttl;
+        private SeqNoState seqNo;
+        private RekeyState rekey = RekeyState.idle();
+
+        private Builder(int id, long accessHash, long peerId, boolean creator) {
+            this.id = id;
+            this.accessHash = accessHash;
+            this.peerId = peerId;
+            this.seqNo = new SeqNoState(creator);
+        }
+
+        private Builder(SecretChatState state) {
+            this.id = state.id;
+            this.accessHash = state.accessHash;
+            this.peerId = state.peerId;
+            this.status = state.status;
+            this.secret = state.secret;
+            this.key = state.key;
+            this.oldKey = state.oldKey;
+            this.keyCreatedAt = state.keyCreatedAt;
+            this.remainingMessages = state.remainingMessages;
+            this.layer = state.layer;
+            this.ttl = state.ttl;
+            this.seqNo = state.seqNo;
+            this.rekey = state.rekey;
+        }
+
+        public Builder status(Status status) {
+            this.status = status;
+            return this;
+        }
+
+        public Builder secret(@Nullable BigInteger secret) {
+            this.secret = secret;
+            return this;
+        }
+
+        /**
+         * Installs a newly negotiated key, keeping the previous one, and restarts the counters
+         * which decide when to replace it again.
+         *
+         * <p> The old key is kept because a replacement is not instantaneous: messages the peer
+         * sent before it processed our commit are still encrypted with it, and arrive after.
+         *
+         * <p> The private exponent is dropped here: it exists only to reach this point, and
+         * keeping it afterwards would leave the material to re-derive the key sitting in storage
+         * for the lifetime of the chat.
+         */
+        public Builder key(AuthKey key, Instant createdAt) {
+            this.oldKey = this.key;
+            this.key = Objects.requireNonNull(key);
+            this.keyCreatedAt = Objects.requireNonNull(createdAt);
+            this.remainingMessages = DEFAULT_MESSAGES_PER_KEY;
+            this.secret = null;
+            return this;
+        }
+
+        /** Restores a key as stored, without any of the bookkeeping {@link #key} performs. */
+        public Builder restoreKey(@Nullable AuthKey key, @Nullable Instant createdAt) {
+            this.key = key;
+            this.keyCreatedAt = createdAt;
+            return this;
+        }
+
+        /** Sets the previous key, or clears it once the peer is known to have moved on. */
+        public Builder oldKey(@Nullable AuthKey oldKey) {
+            this.oldKey = oldKey;
+            return this;
+        }
+
+        public Builder remainingMessages(int remainingMessages) {
+            this.remainingMessages = remainingMessages;
+            return this;
+        }
+
+        public Builder layer(int layer) {
+            this.layer = layer;
+            return this;
+        }
+
+        public Builder ttl(int ttl) {
+            this.ttl = ttl;
+            return this;
+        }
+
+        public Builder seqNo(SeqNoState seqNo) {
+            this.seqNo = Objects.requireNonNull(seqNo);
+            return this;
+        }
+
+        public Builder rekey(RekeyState rekey) {
+            this.rekey = Objects.requireNonNull(rekey);
+            return this;
+        }
+
+        public SecretChatState build() {
+            return new SecretChatState(this);
+        }
     }
 }

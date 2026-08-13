@@ -32,14 +32,16 @@ package telegram4j.mtproto.secret;
  * which makes the resulting drift look like an off-by-one specific to the peer's platform. Here
  * that value is kept apart as {@link #remoteInSeqNo()} and only used to bound-check the peer.
  *
- * @implNote Instances are mutable and not thread safe.
+ * <p> Instances are immutable: both operations hand back the state that follows them, so a
+ * counter cannot advance without the caller deciding to keep the result.
+ *
  * @see <a href="https://core.telegram.org/api/end-to-end/seq_no">Sequence numbers in Secret Chats</a>
  */
 public final class SeqNoState {
 
     /** How an incoming message relates to what we have already processed. */
     public enum Status {
-        /** The message is the next one expected and has been counted as received. */
+        /** The message is the next one expected. */
         EXPECTED,
         /** The message has already been processed and must be dropped. */
         REPEATED,
@@ -47,18 +49,33 @@ public final class SeqNoState {
         GAP
     }
 
-    /** The classification of an incoming message together with its raw sequence number. */
-    public record Incoming(Status status, int seqNo) {}
+    /**
+     * The wire values for an outgoing message, and the counters that follow sending it.
+     *
+     * @param inSeqNo The {@code in_seq_no} to put in the {@code decryptedMessageLayer}.
+     * @param outSeqNo The {@code out_seq_no} to put in the {@code decryptedMessageLayer}.
+     * @param next The counters to persist, before the message is sent.
+     */
+    public record Allocated(int inSeqNo, int outSeqNo, SeqNoState next) {}
 
-    /** The pair of wire values to put into an outgoing {@code decryptedMessageLayer}. */
-    public record WireSeqNo(int inSeqNo, int outSeqNo) {}
+    /**
+     * The classification of an incoming message, and the counters that follow it.
+     *
+     * @param status What to do with the message.
+     * @param seqNo The raw sequence number of the message.
+     * @param next The counters to persist. They differ from the previous ones even when the
+     * message is {@link Status#REPEATED} or {@link Status#GAP}, since the peer's acknowledgement
+     * is recorded either way.
+     */
+    public record Incoming(Status status, int seqNo, SeqNoState next) {}
 
+    private final boolean creator;
     private final int inBase;
     private final int outBase;
 
-    private int inSeqNo;
-    private int outSeqNo;
-    private int remoteInSeqNo;
+    private final int inSeqNo;
+    private final int outSeqNo;
+    private final int remoteInSeqNo;
 
     /**
      * Creates the counters of a chat which has just been established.
@@ -66,16 +83,22 @@ public final class SeqNoState {
      * @param creator whether the chat was created by us, i.e. whether we are its {@code admin_id}.
      */
     public SeqNoState(boolean creator) {
-        this.inBase = creator ? 0 : 1;
-        this.outBase = creator ? 1 : 0;
+        this(creator, 0, 0, 0);
     }
 
     /** Restores previously persisted counters. */
     public SeqNoState(boolean creator, int inSeqNo, int outSeqNo, int remoteInSeqNo) {
-        this(creator);
+        this.creator = creator;
+        this.inBase = creator ? 0 : 1;
+        this.outBase = creator ? 1 : 0;
         this.inSeqNo = inSeqNo;
         this.outSeqNo = outSeqNo;
         this.remoteInSeqNo = remoteInSeqNo;
+    }
+
+    /** {@return Whether the chat was created by us} */
+    public boolean creator() {
+        return creator;
     }
 
     /** {@return The number of messages received and processed so far} */
@@ -94,26 +117,28 @@ public final class SeqNoState {
     }
 
     /**
-     * Allocates the sequence numbers of the next outgoing message and counts it as sent.
+     * Computes the sequence numbers of the next outgoing message.
      *
-     * <p> This must be called once per message actually handed to {@code messages.sendEncrypted*},
-     * including service messages, and the result must be persisted before the request is made:
-     * a message sent but not counted leaves the peer permanently ahead of us.
+     * <p> {@link Allocated#next()} must be persisted before the message is handed to
+     * {@code messages.sendEncrypted*}: a message sent but not counted leaves the peer permanently
+     * ahead of us.
      *
-     * @return The values to put into the {@code decryptedMessageLayer}.
+     * @return The values to put into the {@code decryptedMessageLayer}, and the counters that
+     * follow sending it.
      */
-    public WireSeqNo allocate() {
-        return new WireSeqNo(2 * inSeqNo + inBase, 2 * outSeqNo++ + outBase);
+    public Allocated allocate() {
+        return new Allocated(2 * inSeqNo + inBase, 2 * outSeqNo + outBase,
+                new SeqNoState(creator, inSeqNo, outSeqNo + 1, remoteInSeqNo));
     }
 
     /**
-     * Classifies an incoming message, and counts it as received when it is the expected one.
+     * Classifies an incoming message.
      *
      * @param inSeqNo the {@code in_seq_no} of the received {@code decryptedMessageLayer}.
      * @param outSeqNo the {@code out_seq_no} of the received {@code decryptedMessageLayer}.
      * @throws SecretChatException if the values do not belong to the peer, or if the peer claims
      * to have processed messages we never sent, or fewer than it claimed before.
-     * @return The classification and the raw sequence number of the message.
+     * @return The classification, the raw sequence number, and the counters that follow.
      */
     public Incoming accept(int inSeqNo, int outSeqNo) {
         // The peer's counters are based the opposite way round from ours, so these are the
@@ -137,17 +162,18 @@ public final class SeqNoState {
             throw new SecretChatException("in_seq_no is bigger than the number of sent messages: "
                     + remoteIn + " > " + this.outSeqNo);
         }
-        remoteInSeqNo = remoteIn;
 
         if (seqNo < this.inSeqNo) {
-            return new Incoming(Status.REPEATED, seqNo);
+            return new Incoming(Status.REPEATED, seqNo,
+                    new SeqNoState(creator, this.inSeqNo, this.outSeqNo, remoteIn));
         }
         if (seqNo > this.inSeqNo) {
-            return new Incoming(Status.GAP, seqNo);
+            return new Incoming(Status.GAP, seqNo,
+                    new SeqNoState(creator, this.inSeqNo, this.outSeqNo, remoteIn));
         }
 
-        this.inSeqNo++;
-        return new Incoming(Status.EXPECTED, seqNo);
+        return new Incoming(Status.EXPECTED, seqNo,
+                new SeqNoState(creator, this.inSeqNo + 1, this.outSeqNo, remoteIn));
     }
 
     /**
@@ -158,6 +184,23 @@ public final class SeqNoState {
      */
     public int toRemoteWireSeqNo(int seqNo) {
         return 2 * seqNo + inBase;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof SeqNoState s)) return false;
+        return creator == s.creator && inSeqNo == s.inSeqNo
+                && outSeqNo == s.outSeqNo && remoteInSeqNo == s.remoteInSeqNo;
+    }
+
+    @Override
+    public int hashCode() {
+        int h = Boolean.hashCode(creator);
+        h = h * 31 + inSeqNo;
+        h = h * 31 + outSeqNo;
+        h = h * 31 + remoteInSeqNo;
+        return h;
     }
 
     @Override

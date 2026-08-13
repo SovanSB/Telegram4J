@@ -169,19 +169,17 @@ public class FileStoreLayout implements StoreLayout, SecretChatStore {
 
         var seqNo = new SeqNoState(creator, buf.readIntLE(), buf.readIntLE(), buf.readIntLE());
 
-        var chat = new SecretChatState(id, accessHash, peerId, creator, status, seqNo);
-        if (key != null) {
-            chat.key(key, keyCreatedAt != 0 ? Instant.ofEpochSecond(keyCreatedAt) : null);
-            chat.remainingMessages(remainingMessages);
-        }
-        if (oldKey != null) {
-            chat.oldKey(oldKey);
-        }
-        // after key(), which drops the exponent: this restores what was written rather than
-        // depending on the order the setters happen to be called in
-        chat.secret(secret);
-        chat.layer(layer);
-        chat.ttl(ttl);
+        // restoreKey rather than key: this is putting back what was written, not the bookkeeping
+        // that goes with negotiating a new one
+        var chat = SecretChatState.builder(id, accessHash, peerId, creator)
+                .status(status)
+                .restoreKey(key, keyCreatedAt != 0 ? Instant.ofEpochSecond(keyCreatedAt) : null)
+                .oldKey(oldKey)
+                .secret(secret)
+                .remainingMessages(remainingMessages)
+                .layer(layer)
+                .ttl(ttl)
+                .seqNo(seqNo);
 
         var rekeyStatus = RekeyState.Status.values()[buf.readUnsignedByte()];
         if (rekeyStatus != RekeyState.Status.IDLE) {
@@ -191,7 +189,7 @@ public class FileStoreLayout implements StoreLayout, SecretChatStore {
                     ? RekeyState.requested(exchangeId, CryptoUtil.fromByteBuf(param.retain()))
                     : RekeyState.accepted(exchangeId, new AuthKey(param)));
         }
-        return chat;
+        return chat.build();
     }
 
     protected interface Deserializer {

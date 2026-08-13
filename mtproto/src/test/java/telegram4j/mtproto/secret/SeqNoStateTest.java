@@ -17,7 +17,6 @@ package telegram4j.mtproto.secret;
 
 import org.junit.jupiter.api.Test;
 import telegram4j.mtproto.secret.SeqNoState.Status;
-import telegram4j.mtproto.secret.SeqNoState.WireSeqNo;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -27,23 +26,47 @@ class SeqNoStateTest {
     void creatorParity() {
         // https://core.telegram.org/api/end-to-end/seq_no: the initiator sends odd out_seq_no
         // and even in_seq_no, the other participant the other way round
-        assertEquals(new WireSeqNo(0, 1), new SeqNoState(true).allocate());
-        assertEquals(new WireSeqNo(1, 0), new SeqNoState(false).allocate());
+        var creator = new SeqNoState(true).allocate();
+        assertEquals(0, creator.inSeqNo());
+        assertEquals(1, creator.outSeqNo());
+
+        var participant = new SeqNoState(false).allocate();
+        assertEquals(1, participant.inSeqNo());
+        assertEquals(0, participant.outSeqNo());
+    }
+
+    @Test
+    void allocatingLeavesTheSourceAlone() {
+        // the counter may not advance without the caller keeping the result: it has to reach the
+        // disk before the message it belongs to reaches the peer
+        var state = new SeqNoState(true);
+
+        assertEquals(1, state.allocate().outSeqNo());
+        assertEquals(1, state.allocate().outSeqNo(), "allocate() advanced the state it was called on");
+        assertEquals(0, state.outSeqNo());
+
+        assertEquals(1, state.allocate().next().outSeqNo());
     }
 
     @Test
     void countersAdvanceIndependently() {
-        var creator = new SeqNoState(true);
+        var state = new SeqNoState(true);
 
-        assertEquals(new WireSeqNo(0, 1), creator.allocate());
-        assertEquals(new WireSeqNo(0, 3), creator.allocate());
+        var first = state.allocate();
+        assertEquals(1, first.outSeqNo());
+        var second = first.next().allocate();
+        assertEquals(3, second.outSeqNo());
+        assertEquals(0, second.inSeqNo());
 
         // receiving advances only the incoming counter
-        assertEquals(new SeqNoState.Incoming(Status.EXPECTED, 0), creator.accept(1, 0));
-        assertEquals(1, creator.inSeqNo());
-        assertEquals(2, creator.outSeqNo());
+        var received = second.next().accept(1, 0);
+        assertEquals(Status.EXPECTED, received.status());
+        assertEquals(1, received.next().inSeqNo());
+        assertEquals(2, received.next().outSeqNo());
 
-        assertEquals(new WireSeqNo(2, 5), creator.allocate());
+        var third = received.next().allocate();
+        assertEquals(2, third.inSeqNo());
+        assertEquals(5, third.outSeqNo());
     }
 
     @Test
@@ -53,10 +76,18 @@ class SeqNoStateTest {
 
         for (int i = 0; i < 16; i++) {
             var sent = creator.allocate();
-            assertEquals(new SeqNoState.Incoming(Status.EXPECTED, i), participant.accept(sent.inSeqNo(), sent.outSeqNo()));
+            creator = sent.next();
+            var atParticipant = participant.accept(sent.inSeqNo(), sent.outSeqNo());
+            assertEquals(Status.EXPECTED, atParticipant.status());
+            assertEquals(i, atParticipant.seqNo());
+            participant = atParticipant.next();
 
             var reply = participant.allocate();
-            assertEquals(new SeqNoState.Incoming(Status.EXPECTED, i), creator.accept(reply.inSeqNo(), reply.outSeqNo()));
+            participant = reply.next();
+            var atCreator = creator.accept(reply.inSeqNo(), reply.outSeqNo());
+            assertEquals(Status.EXPECTED, atCreator.status());
+            assertEquals(i, atCreator.seqNo());
+            creator = atCreator.next();
         }
 
         assertEquals(16, creator.inSeqNo());
@@ -70,37 +101,42 @@ class SeqNoStateTest {
         // it is replying to reports one less than we have sent, and adopting that value would
         // make the next message reuse a sequence number
         var creator = new SeqNoState(true);
-        creator.allocate();
-        creator.allocate();
-        creator.allocate();
+        for (int i = 0; i < 3; i++) {
+            creator = creator.allocate().next();
+        }
 
         // the participant answers acknowledging only one of our three messages
-        var lagging = new SeqNoState(false);
-        lagging.accept(0, 1);
+        var lagging = new SeqNoState(false).accept(0, 1).next();
         var reply = lagging.allocate();
-        assertEquals(new WireSeqNo(3, 0), reply);
+        assertEquals(3, reply.inSeqNo());
+        assertEquals(0, reply.outSeqNo());
 
-        assertEquals(new SeqNoState.Incoming(Status.EXPECTED, 0), creator.accept(reply.inSeqNo(), reply.outSeqNo()));
-        assertEquals(1, creator.remoteInSeqNo());
-        assertEquals(3, creator.outSeqNo(), "outgoing counter must not follow the peer");
-        assertEquals(new WireSeqNo(2, 7), creator.allocate());
+        var atCreator = creator.accept(reply.inSeqNo(), reply.outSeqNo());
+        assertEquals(Status.EXPECTED, atCreator.status());
+        assertEquals(1, atCreator.next().remoteInSeqNo());
+        assertEquals(3, atCreator.next().outSeqNo(), "outgoing counter must not follow the peer");
+        assertEquals(7, atCreator.next().allocate().outSeqNo());
     }
 
     @Test
     void detectsRepeatsAndGaps() {
         var participant = new SeqNoState(false);
 
-        assertEquals(Status.EXPECTED, participant.accept(0, 1).status());
+        var first = participant.accept(0, 1);
+        assertEquals(Status.EXPECTED, first.status());
+        participant = first.next();
+
         assertEquals(Status.REPEATED, participant.accept(0, 1).status());
 
         // the creator's third message arrives before its second
         var gap = participant.accept(0, 5);
         assertEquals(Status.GAP, gap.status());
         assertEquals(2, gap.seqNo());
-        assertEquals(1, participant.inSeqNo(), "a gap must not advance the counter");
+        assertEquals(1, gap.next().inSeqNo(), "a gap must not advance the counter");
 
-        assertEquals(Status.EXPECTED, participant.accept(0, 3).status());
-        assertEquals(Status.EXPECTED, participant.accept(0, 5).status());
+        var second = participant.accept(0, 3);
+        assertEquals(Status.EXPECTED, second.status());
+        assertEquals(Status.EXPECTED, second.next().accept(0, 5).status());
     }
 
     @Test
@@ -116,18 +152,29 @@ class SeqNoStateTest {
 
     @Test
     void rejectsImpossibleAcknowledgements() {
-        var creator = new SeqNoState(true);
-        creator.allocate();
+        var creator = new SeqNoState(true).allocate().next();
 
         // the peer claims to have processed messages we never sent
         assertThrowsExactly(SecretChatException.class, () -> creator.accept(7, 0));
 
         // ...and one of slack is allowed, for a peer that counts the message it is replying to
-        assertEquals(Status.EXPECTED, creator.accept(5, 0).status());
+        var accepted = creator.accept(5, 0);
+        assertEquals(Status.EXPECTED, accepted.status());
 
         // going backwards afterwards is a protocol violation
-        var e = assertThrowsExactly(SecretChatException.class, () -> creator.accept(1, 2));
+        var e = assertThrowsExactly(SecretChatException.class, () -> accepted.next().accept(1, 2));
         assertTrue(e.getMessage().startsWith("in_seq_no is decreasing"), e.getMessage());
+    }
+
+    @Test
+    void theAcknowledgementIsKeptEvenWhenTheMessageIsNot() {
+        // a repeat still tells us the peer has moved on, and that is worth recording
+        var creator = new SeqNoState(true, 1, 4, 0);
+
+        var repeated = creator.accept(5, 0);
+        assertEquals(Status.REPEATED, repeated.status());
+        assertEquals(2, repeated.next().remoteInSeqNo());
+        assertEquals(1, repeated.next().inSeqNo());
     }
 
     @Test
@@ -140,9 +187,7 @@ class SeqNoStateTest {
         assertEquals(0, creator.toRemoteWireSeqNo(0));
         assertEquals(4, creator.toRemoteWireSeqNo(2));
 
-        participant.allocate();
-        participant.allocate();
-        var third = participant.allocate();
+        var third = participant.allocate().next().allocate().next().allocate();
         assertEquals(creator.toRemoteWireSeqNo(2), third.outSeqNo());
     }
 
@@ -150,10 +195,14 @@ class SeqNoStateTest {
     void restoresPersistedCounters() {
         var restored = new SeqNoState(true, 7, 9, 6);
 
-        assertEquals(new WireSeqNo(14, 19), restored.allocate());
-        assertEquals(Status.EXPECTED, restored.accept(13, 14).status());
-        assertEquals(8, restored.inSeqNo());
-        assertEquals(10, restored.outSeqNo());
-        assertEquals(6, restored.remoteInSeqNo());
+        var allocated = restored.allocate();
+        assertEquals(14, allocated.inSeqNo());
+        assertEquals(19, allocated.outSeqNo());
+
+        var received = allocated.next().accept(13, 14);
+        assertEquals(Status.EXPECTED, received.status());
+        assertEquals(8, received.next().inSeqNo());
+        assertEquals(10, received.next().outSeqNo());
+        assertEquals(6, received.next().remoteInSeqNo());
     }
 }

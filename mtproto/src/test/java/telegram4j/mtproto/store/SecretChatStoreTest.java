@@ -93,7 +93,7 @@ class SecretChatStoreTest {
         var restored = open().getSecretChat(original.id()).block();
         assertNotNull(restored);
         // the same allocation on the restored state must yield the same numbers
-        assertEquals(expectedNext + 2, restored.seqNo().allocate().outSeqNo());
+        assertEquals(expectedNext, restored.seqNo().allocate().outSeqNo());
     }
 
     @Test
@@ -101,9 +101,10 @@ class SecretChatStoreTest {
         // a chat we asked for but which nobody has accepted yet is only recoverable if the
         // private exponent outlives the process
         var secret = new BigInteger(1, randomBytes(256, 7));
-        var pending = new SecretChatState(9001, 42L, 1234L, true,
-                SecretChatState.Status.REQUESTED, new SeqNoState(true));
-        pending.secret(secret);
+        var pending = SecretChatState.builder(9001, 42L, 1234L, true)
+                .status(SecretChatState.Status.REQUESTED)
+                .secret(secret)
+                .build();
 
         var store = open();
         store.updateSecretChat(pending).block();
@@ -120,12 +121,14 @@ class SecretChatStoreTest {
     void forgetsTheSecretOnceKeyed() {
         // the exponent exists only to reach the key; keeping it afterwards would leave the
         // material to re-derive that key in storage for the lifetime of the chat
-        var chat = new SecretChatState(9002, 42L, 1234L, true,
-                SecretChatState.Status.REQUESTED, new SeqNoState(true));
-        chat.secret(new BigInteger(1, randomBytes(256, 13)));
-
-        chat.key(new AuthKey(Unpooled.wrappedBuffer(randomBytes(256, 14))), Instant.ofEpochSecond(1_700_000_000L));
-        chat.status(SecretChatState.Status.READY);
+        var chat = SecretChatState.builder(9002, 42L, 1234L, true)
+                .status(SecretChatState.Status.REQUESTED)
+                .secret(new BigInteger(1, randomBytes(256, 13)))
+                .build()
+                .toBuilder()
+                .key(new AuthKey(Unpooled.wrappedBuffer(randomBytes(256, 14))), Instant.ofEpochSecond(1_700_000_000L))
+                .status(SecretChatState.Status.READY)
+                .build();
         assertNull(chat.secret());
 
         var store = open();
@@ -140,9 +143,10 @@ class SecretChatStoreTest {
 
     @Test
     void keepsRekeyInProgress() {
-        var chat = ready();
         var secret = new BigInteger(1, randomBytes(256, 11));
-        chat.rekey(RekeyState.requested(0x0123456789abcdefL, secret));
+        var chat = ready().toBuilder()
+                .rekey(RekeyState.requested(0x0123456789abcdefL, secret))
+                .build();
 
         var store = open();
         store.updateSecretChat(chat).block();
@@ -153,6 +157,26 @@ class SecretChatStoreTest {
         assertEquals(RekeyState.Status.REQUESTED, restored.rekey().status());
         assertEquals(0x0123456789abcdefL, restored.rekey().exchangeId());
         assertEquals(secret, restored.rekey().secret());
+    }
+
+    @Test
+    void whatTheStoreHandsOutCannotChangeUnderIt() {
+        // the store keeps what it was given rather than a copy, so a state that could be mutated
+        // would let a caller advance the stored counters without ever writing them back, and
+        // leave nothing to roll back to when the write failed
+        var store = open();
+        store.updateSecretChat(ready()).block();
+
+        var read = store.getSecretChat(4242).block();
+        assertNotNull(read);
+
+        var advanced = read.toBuilder().seqNo(read.seqNo().allocate().next()).build();
+        assertNotEquals(read.seqNo().outSeqNo(), advanced.seqNo().outSeqNo());
+
+        var stillStored = store.getSecretChat(4242).block();
+        assertNotNull(stillStored);
+        assertEquals(read.seqNo().outSeqNo(), stillStored.seqNo().outSeqNo(),
+                "deriving a new state advanced the stored one");
     }
 
     @Test
@@ -179,14 +203,16 @@ class SecretChatStoreTest {
     }
 
     static SecretChatState ready() {
-        var chat = new SecretChatState(4242, 0x1122334455667788L, 999L, true,
-                SecretChatState.Status.READY, new SeqNoState(true, 5, 7, 4));
-        chat.key(new AuthKey(Unpooled.wrappedBuffer(randomBytes(256, 1))), Instant.ofEpochSecond(1_700_000_000L));
-        chat.key(new AuthKey(Unpooled.wrappedBuffer(randomBytes(256, 2))), Instant.ofEpochSecond(1_700_000_500L));
-        chat.layer(143);
-        chat.ttl(60);
-        chat.remainingMessages(93);
-        return chat;
+        return SecretChatState.builder(4242, 0x1122334455667788L, 999L, true)
+                .status(SecretChatState.Status.READY)
+                .seqNo(new SeqNoState(true, 5, 7, 4))
+                // twice, so that the first key ends up as the old one still accepted in flight
+                .key(new AuthKey(Unpooled.wrappedBuffer(randomBytes(256, 1))), Instant.ofEpochSecond(1_700_000_000L))
+                .key(new AuthKey(Unpooled.wrappedBuffer(randomBytes(256, 2))), Instant.ofEpochSecond(1_700_000_500L))
+                .layer(143)
+                .ttl(60)
+                .remainingMessages(93)
+                .build();
     }
 
     static byte[] randomBytes(int size, long seed) {
