@@ -113,9 +113,18 @@ public final class RekeyState {
      *
      * <p> Only meaningful when a replacement is already in progress. The larger id proceeds; equal
      * ids mean both sides drew the same number and neither does.
+     *
+     * <p> The comparison is signed, because the id is a TL {@code long} and both reference
+     * implementations compare it as one. Half of all ids are negative, so reading it as unsigned
+     * would leave the two sides disagreeing about who won for half of the collisions.
      */
     public boolean isOutrankedBy(long otherExchangeId) {
-        return status != Status.IDLE && Long.compareUnsigned(otherExchangeId, exchangeId) > 0;
+        return status != Status.IDLE && otherExchangeId > exchangeId;
+    }
+
+    /** {@return Whether both sides drew the same id, in which case neither replacement proceeds} */
+    public boolean tiesWith(long otherExchangeId) {
+        return status != Status.IDLE && otherExchangeId == exchangeId;
     }
 
     @Override

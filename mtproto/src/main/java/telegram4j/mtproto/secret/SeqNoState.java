@@ -136,6 +136,11 @@ public final class SeqNoState {
      *
      * @param inSeqNo the {@code in_seq_no} of the received {@code decryptedMessageLayer}.
      * @param outSeqNo the {@code out_seq_no} of the received {@code decryptedMessageLayer}.
+     * <p> Rejecting an acknowledgement lower than the last one is only sound while messages
+     * reach here in the order the peer sent them: a message overtaken in transit legitimately
+     * carries a staler view of our progress than one already processed. Until gaps are held and
+     * refilled, a reordered message therefore fails this check rather than being queued.
+     *
      * @throws SecretChatException if the values do not belong to the peer, or if the peer claims
      * to have processed messages we never sent, or fewer than it claimed before.
      * @return The classification, the raw sequence number, and the counters that follow.

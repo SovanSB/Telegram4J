@@ -20,6 +20,7 @@ import reactor.core.publisher.Mono;
 import reactor.util.Logger;
 import reactor.util.Loggers;
 import reactor.util.annotation.Nullable;
+import telegram4j.mtproto.auth.AuthKey;
 import telegram4j.mtproto.auth.DhParameters;
 import telegram4j.mtproto.auth.DhPrimeChecker;
 import telegram4j.mtproto.auth.DhPrimeCheckerCache;
@@ -33,6 +34,7 @@ import telegram4j.tl.secret.*;
 import telegram4j.tl.messages.BaseDhConfig;
 import telegram4j.tl.messages.DhConfigNotModified;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Objects;
 
@@ -171,11 +173,13 @@ public final class SecretChatManager {
     public Mono<Void> sendMessage(int chatId, String text) {
         Objects.requireNonNull(text);
 
+        // also checked after sending, so a chat nobody answers still replaces its key
         return withChat(chatId, state -> send(state, BaseDecryptedMessage.builder()
                 .randomId(random.nextLong())
                 .ttl(state.ttl())
                 .message(text)
-                .build(), false));
+                .build(), false)
+                .flatMap(sent -> rekeyIfWorn(sent).thenReturn(sent)));
     }
 
     /**
@@ -203,8 +207,17 @@ public final class SecretChatManager {
             return Mono.empty();
         }
 
+        // a replacement is not instantaneous: messages the peer sent before it processed our
+        // commit are still under the old key, and the fingerprint in the payload says which
+        var payload = message.bytes();
+        var oldKey = state.oldKey();
+        if (oldKey != null && payload.readableBytes() >= 8
+                && payload.getLongLE(payload.readerIndex()) == oldKey.id()) {
+            key = oldKey;
+        }
+
         var decrypted = new SecretChatCipher(acceptLegacyMTProto)
-                .decrypt(key, state.creator(), message.bytes());
+                .decrypt(key, state.creator(), payload);
         if (!(decrypted instanceof DecryptedMessageLayer layer)) {
             // layer 8 wrapped the message directly, without sequence numbers to check
             throw new SecretChatException("Unsupported end-to-end object: " + decrypted);
@@ -236,15 +249,26 @@ public final class SecretChatManager {
         builder.remainingMessages(Math.max(0, state.remainingMessages() - 1));
 
         var inner = layer.message();
-        DecryptedMessage delivered = inner;
-        if (inner instanceof DecryptedMessageService serviceMessage) {
-            applyAction(builder, state, serviceMessage.action());
-            delivered = null;
+        if (!(inner instanceof DecryptedMessageService serviceMessage)) {
+            var updated = builder.build();
+            return store.updateSecretChat(updated)
+                    .then(rekeyIfWorn(updated))
+                    .thenReturn(inner);
         }
 
-        var next = delivered;
-        return store.updateSecretChat(builder.build())
-                .then(next == null ? Mono.empty() : Mono.just(next));
+        var action = serviceMessage.action();
+        // a key replacement answers the peer, so it takes over the state this message produced
+        // rather than being folded into the builder
+        var rekeyed = rekeyAction(builder.build(), action);
+        if (rekeyed != null) {
+            return rekeyed.then(Mono.empty());
+        }
+
+        applyAction(builder, state, action);
+        var updated = builder.build();
+        return store.updateSecretChat(updated)
+                .then(rekeyIfWorn(updated))
+                .then(Mono.empty());
     }
 
     // service actions change the chat rather than being delivered to the caller
@@ -259,9 +283,199 @@ public final class SecretChatManager {
             }
             case DecryptedMessageActionSetMessageTTL.ID ->
                     builder.ttl(((DecryptedMessageActionSetMessageTTL) action).ttlSeconds());
-            // TODO requestKey, acceptKey, commitKey and abortKey once rekeying lands
             default -> log.debug("Unhandled service action in secret chat {}: {}", state.id(), action);
         }
+    }
+
+    // the actions of a key replacement, which answer the peer and so cannot be applied to the
+    // builder alone; each returns the state it leaves behind, already persisted
+    @Nullable
+    private Mono<SecretChatState> rekeyAction(SecretChatState state, DecryptedMessageAction action) {
+        return switch (action.identifier()) {
+            case DecryptedMessageActionRequestKey.ID ->
+                    onRequestKey(state, (DecryptedMessageActionRequestKey) action);
+            case DecryptedMessageActionAcceptKey.ID ->
+                    onAcceptKey(state, (DecryptedMessageActionAcceptKey) action);
+            case DecryptedMessageActionCommitKey.ID ->
+                    onCommitKey(state, (DecryptedMessageActionCommitKey) action);
+            case DecryptedMessageActionAbortKey.ID -> {
+                log.debug("Peer aborted the key replacement in secret chat {}", state.id());
+                var idle = state.toBuilder().rekey(RekeyState.idle()).build();
+                yield store.updateSecretChat(idle).thenReturn(idle);
+            }
+            default -> null;
+        };
+    }
+
+    /** How long a key may stay in use however few messages it carries. */
+    private static final Duration MAX_KEY_AGE = Duration.ofDays(7);
+
+    /**
+     * Asks for a replacement when the current key has carried enough messages or stood long
+     * enough, which is what makes the replacement automatic rather than something a caller has
+     * to remember.
+     */
+    private Mono<Void> rekeyIfWorn(SecretChatState state) {
+        if (state.rekey().status() != RekeyState.Status.IDLE
+                || state.status() != SecretChatState.Status.READY) {
+            return Mono.empty();
+        }
+
+        var createdAt = state.keyCreatedAt();
+        boolean worn = state.remainingMessages() <= 0
+                || createdAt != null && createdAt.plus(MAX_KEY_AGE).isBefore(Instant.now());
+        if (!worn) {
+            return Mono.empty();
+        }
+
+        log.debug("Key of secret chat {} is worn out, replacing it", state.id());
+        // a failure here must not fail the message that prompted it: the chat keeps working on
+        // the old key, and the next message tries again
+        return rekey(state.id())
+                .onErrorResume(e -> {
+                    log.warn("Failed to start replacing the key of secret chat {}", state.id(), e);
+                    return Mono.empty();
+                });
+    }
+
+    /**
+     * Replaces the key of a chat, so that a key which leaks exposes only the messages around it.
+     *
+     * <p> Called on its own when the current key wears out, so a caller only needs this to force
+     * a replacement earlier. Does nothing if one is already in progress.
+     *
+     * @param chatId The id of the chat.
+     * @return A {@link Mono} completing when the request has been sent.
+     */
+    public Mono<Void> rekey(int chatId) {
+        return withChat(chatId, state -> {
+            if (state.rekey().status() != RekeyState.Status.IDLE) {
+                return Mono.empty();
+            }
+            return dhParameters().flatMap(dh -> {
+                var secret = DhParameters.generateSecret();
+                var gA = dh.computePublicKeyData(secret);
+                long exchangeId = random.nextLong();
+
+                var next = state.toBuilder()
+                        .rekey(RekeyState.requested(exchangeId, secret))
+                        .build();
+
+                log.debug("Requesting a new key for secret chat {}, exchange 0x{}",
+                        chatId, Long.toHexString(exchangeId));
+                return sendService(next, ImmutableDecryptedMessageActionRequestKey.of(exchangeId, gA));
+            });
+        });
+    }
+
+    // the peer wants a new key
+    private Mono<SecretChatState> onRequestKey(SecretChatState state, DecryptedMessageActionRequestKey request) {
+        long exchangeId = request.exchangeId();
+        var rekey = state.rekey();
+
+        if (rekey.tiesWith(exchangeId)) {
+            // both sides drew the same number, so neither proceeds
+            log.warn("Both sides asked to replace the key of secret chat {} with the same exchange id",
+                    state.id());
+            var idle = state.toBuilder().rekey(RekeyState.idle()).build();
+            return store.updateSecretChat(idle).thenReturn(idle);
+        }
+        if (rekey.status() != RekeyState.Status.IDLE && !rekey.isOutrankedBy(exchangeId)) {
+            log.debug("Ignoring the peer's key replacement in secret chat {}, ours outranks it", state.id());
+            return store.updateSecretChat(state).thenReturn(state);
+        }
+
+        return dhParameters().flatMap(dh -> {
+            var secret = DhParameters.generateSecret();
+            var gB = dh.computePublicKeyData(secret);
+            var pending = SecretChatKeyExchange.deriveKey(dh, request.gA(), secret);
+
+            var next = state.toBuilder()
+                    .rekey(RekeyState.accepted(exchangeId, pending))
+                    .build();
+
+            log.debug("Accepting a new key for secret chat {}, exchange 0x{}",
+                    state.id(), Long.toHexString(exchangeId));
+            return sendService(next, ImmutableDecryptedMessageActionAcceptKey.of(
+                    exchangeId, gB, pending.id()));
+        });
+    }
+
+    // the peer answered the replacement we asked for
+    private Mono<SecretChatState> onAcceptKey(SecretChatState state, DecryptedMessageActionAcceptKey accept) {
+        long exchangeId = accept.exchangeId();
+        var rekey = state.rekey();
+        var secret = rekey.secret();
+
+        if (rekey.status() != RekeyState.Status.REQUESTED || rekey.exchangeId() != exchangeId || secret == null) {
+            log.debug("Ignoring acceptKey for an exchange we are not running in secret chat {}", state.id());
+            var idle = state.toBuilder().rekey(RekeyState.idle()).build();
+            return store.updateSecretChat(idle).thenReturn(idle);
+        }
+
+        return dhParameters().flatMap(dh -> {
+            AuthKey replacement;
+            try {
+                replacement = SecretChatKeyExchange.deriveKey(dh, accept.gB(), secret, accept.keyFingerprint());
+            } catch (SecretChatException e) {
+                log.warn("Aborting the key replacement in secret chat {}: {}", state.id(), e.getMessage());
+                return sendService(state.toBuilder().rekey(RekeyState.idle()).build(),
+                                ImmutableDecryptedMessageActionAbortKey.of(exchangeId))
+                        .then(Mono.error(e));
+            }
+
+            // the key is stored before the commit goes out. The other order loses the chat: the
+            // peer switches on receiving the commit, and a crash before we stored the key leaves
+            // us with no way to derive it again and nothing the peer sends readable
+            var next = state.toBuilder()
+                    .key(replacement, Instant.now())
+                    .rekey(RekeyState.idle())
+                    .build();
+
+            log.debug("Committing the new key of secret chat {}", state.id());
+            return sendService(next, ImmutableDecryptedMessageActionCommitKey.of(
+                    exchangeId, replacement.id()), state.key());
+        });
+    }
+
+    // the peer confirms the replacement we accepted
+    private Mono<SecretChatState> onCommitKey(SecretChatState state, DecryptedMessageActionCommitKey commit) {
+        long exchangeId = commit.exchangeId();
+        var rekey = state.rekey();
+        var pending = rekey.pendingKey();
+
+        if (rekey.status() != RekeyState.Status.ACCEPTED || rekey.exchangeId() != exchangeId || pending == null) {
+            log.debug("Ignoring commitKey for an exchange we are not running in secret chat {}", state.id());
+            return store.updateSecretChat(state).thenReturn(state);
+        }
+        if (pending.id() != commit.keyFingerprint()) {
+            log.warn("Aborting the key replacement in secret chat {}: peer committed a key we did not derive",
+                    state.id());
+            return sendService(state.toBuilder().rekey(RekeyState.idle()).build(),
+                            ImmutableDecryptedMessageActionAbortKey.of(exchangeId))
+                    .then(Mono.error(new SecretChatException("Committed key fingerprint mismatch")));
+        }
+
+        var next = state.toBuilder()
+                .key(pending, Instant.now())
+                .rekey(RekeyState.idle())
+                .build();
+
+        // a message under the new key, so the peer sees the switch took effect
+        log.debug("Secret chat {} now uses its replacement key", state.id());
+        return sendService(next, DecryptedMessageActionNoop.instance());
+    }
+
+    private Mono<SecretChatState> sendService(SecretChatState state, DecryptedMessageAction action) {
+        return sendService(state, action, null);
+    }
+
+    private Mono<SecretChatState> sendService(SecretChatState state, DecryptedMessageAction action,
+                                              @Nullable AuthKey with) {
+        return send(state, DecryptedMessageService.builder()
+                .randomId(random.nextLong())
+                .action(action)
+                .build(), true, with);
     }
 
     /**
@@ -276,7 +490,17 @@ public final class SecretChatManager {
     }
 
     private Mono<SecretChatState> send(SecretChatState state, DecryptedMessage message, boolean serviceMessage) {
-        var key = state.key();
+        return send(state, message, serviceMessage, null);
+    }
+
+    /**
+     * @param with the key to encrypt with, when it must not be the chat's current one. Only
+     * {@code commitKey} needs this: it is what makes the peer switch, so it has to arrive under
+     * the key the peer still holds, while we already hold the replacement.
+     */
+    private Mono<SecretChatState> send(SecretChatState state, DecryptedMessage message,
+                                       boolean serviceMessage, @Nullable AuthKey with) {
+        var key = with != null ? with : state.key();
         if (state.status() != SecretChatState.Status.READY || key == null) {
             return Mono.error(new SecretChatException(
                     "Secret chat " + state.id() + " is not ready, it is " + state.status()));

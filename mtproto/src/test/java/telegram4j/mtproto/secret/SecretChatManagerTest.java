@@ -26,7 +26,6 @@ import telegram4j.mtproto.client.MTProtoClient;
 import telegram4j.mtproto.client.MTProtoClientGroup;
 import telegram4j.mtproto.client.UpdateDispatcher;
 import telegram4j.mtproto.service.ChatService;
-import telegram4j.mtproto.store.SecretChatStore;
 import telegram4j.mtproto.store.StoreLayoutImpl;
 import telegram4j.tl.*;
 import telegram4j.tl.api.TlMethod;
@@ -46,7 +45,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Drives both halves of the exchange against a stand-in for the server, so the flow that only
+ * Drives both halves of a secret chat against a stand-in for the server, so the flow that only
  * ever runs across two devices can be checked without either.
  */
 class SecretChatManagerTest {
@@ -56,20 +55,32 @@ class SecretChatManagerTest {
     static final int CHAT_ID = 4242;
     static final long ACCESS_HASH = 0x1122334455667788L;
 
-    /** Answers the four requests the exchange makes, and remembers what it was told. */
-    static final class FakeServer implements MTProtoClientGroup {
-        final List<TlMethod<?>> requests = new ArrayList<>();
-        /** What each side put on the wire, in order, for the other to be handed. */
-        final List<EncryptedMessage> delivered = new ArrayList<>();
+    /** What the two sides agree on through the server rather than through the chat. */
+    static final class World {
         ByteBuf gA;
         ByteBuf gB;
         long acceptedFingerprint;
         boolean discarded;
+    }
+
+    /**
+     * One side's view of the server, so that what a side sends lands in its own outbox.
+     *
+     * <p> A shared outbox cannot say who sent what, and handing a side its own message back looks
+     * exactly like the mirroring the protocol is built to reject. That only matters once both
+     * sides can speak in the same round, as they do when each asks to replace the key at once.
+     */
+    static final class FakeServer implements MTProtoClientGroup {
+        final World world;
+        final List<EncryptedMessage> outbox = new ArrayList<>();
+
+        FakeServer(World world) {
+            this.world = world;
+        }
 
         @SuppressWarnings("unchecked")
         @Override
         public <R> Mono<R> send(DcId id, TlMethod<? extends R> method) {
-            requests.add(method);
             return Mono.fromSupplier(() -> {
                 if (method instanceof GetDhConfig) {
                     return (R) ImmutableBaseDhConfig.of(TestDhParameters.G,
@@ -77,27 +88,27 @@ class SecretChatManagerTest {
                             Unpooled.EMPTY_BUFFER);
                 }
                 if (method instanceof RequestEncryption request) {
-                    gA = request.gA();
+                    world.gA = request.gA();
                     return (R) ImmutableEncryptedChatWaiting.of(CHAT_ID, ACCESS_HASH, 0, INITIATOR, PARTICIPANT);
                 }
                 if (method instanceof AcceptEncryption request) {
-                    gB = request.gB();
-                    acceptedFingerprint = request.keyFingerprint();
+                    world.gB = request.gB();
+                    world.acceptedFingerprint = request.keyFingerprint();
                     return (R) ImmutableBaseEncryptedChat.of(CHAT_ID, ACCESS_HASH, 0, INITIATOR, PARTICIPANT,
-                            gB, acceptedFingerprint);
+                            world.gB, world.acceptedFingerprint);
                 }
                 if (method instanceof SendEncrypted request) {
-                    delivered.add(ImmutableBaseEncryptedMessage.of(request.randomId(), CHAT_ID, 0,
+                    outbox.add(ImmutableBaseEncryptedMessage.of(request.randomId(), CHAT_ID, 0,
                             request.data(), EncryptedFileEmpty.instance()));
                     return (R) ImmutableBaseSentEncryptedMessage.of(0);
                 }
                 if (method instanceof SendEncryptedService request) {
-                    delivered.add(ImmutableEncryptedMessageService.of(request.randomId(), CHAT_ID, 0,
+                    outbox.add(ImmutableEncryptedMessageService.of(request.randomId(), CHAT_ID, 0,
                             request.data()));
                     return (R) ImmutableBaseSentEncryptedMessage.of(0);
                 }
                 if (method instanceof DiscardEncryption) {
-                    discarded = true;
+                    world.discarded = true;
                     return (R) Boolean.TRUE;
                 }
                 throw new AssertionError("Unexpected request: " + method);
@@ -111,25 +122,71 @@ class SecretChatManagerTest {
         @Override public Mono<MTProtoClient> getOrCreateClient(DcId id) { throw new UnsupportedOperationException(); }
     }
 
-    static SecretChatStore store() {
-        return new StoreLayoutImpl(c -> c);
-    }
+    /** A chat with a manager and a store on each end. */
+    static final class Chat {
+        final World world = new World();
+        final FakeServer initiatorServer = new FakeServer(world);
+        final FakeServer participantServer = new FakeServer(world);
+        final StoreLayoutImpl initiatorStore = new StoreLayoutImpl(c -> c);
+        final StoreLayoutImpl participantStore = new StoreLayoutImpl(c -> c);
+        final SecretChatManager initiator =
+                new SecretChatManager(new ChatService(initiatorServer, initiatorStore), initiatorStore);
+        final SecretChatManager participant =
+                new SecretChatManager(new ChatService(participantServer, participantStore), participantStore);
 
-    static SecretChatManager manager(FakeServer server, SecretChatStore store) {
-        return new SecretChatManager(new ChatService(server, (StoreLayoutImpl) store), store);
+        /** Runs the exchange that gives both sides a key, including the layer each announces. */
+        Chat establish() {
+            initiator.requestSecretChat(ImmutableBaseInputUser.of(PARTICIPANT, 0)).block();
+            participant.onUpdate(requested()).block();
+            initiator.onUpdate(accepted()).block();
+            settle();
+            return this;
+        }
+
+        ImmutableEncryptedChatRequested requested() {
+            return ImmutableEncryptedChatRequested.builder()
+                    .id(CHAT_ID).accessHash(ACCESS_HASH).date(0)
+                    .adminId(INITIATOR).participantId(PARTICIPANT).gA(world.gA)
+                    .build();
+        }
+
+        ImmutableBaseEncryptedChat accepted() {
+            return ImmutableBaseEncryptedChat.of(CHAT_ID, ACCESS_HASH, 0, INITIATOR, PARTICIPANT,
+                    world.gB, world.acceptedFingerprint);
+        }
+
+        /** Delivers everything either side is holding, until neither has anything left to say. */
+        void settle() {
+            while (!initiatorServer.outbox.isEmpty() || !participantServer.outbox.isEmpty()) {
+                var toParticipant = List.copyOf(initiatorServer.outbox);
+                initiatorServer.outbox.clear();
+                toParticipant.forEach(m -> participant.onNewMessage(m).block());
+
+                var toInitiator = List.copyOf(participantServer.outbox);
+                participantServer.outbox.clear();
+                toInitiator.forEach(m -> initiator.onNewMessage(m).block());
+            }
+        }
+
+        SecretChatState initiatorState() {
+            var state = initiatorStore.getSecretChat(CHAT_ID).block();
+            assertNotNull(state);
+            return state;
+        }
+
+        SecretChatState participantState() {
+            var state = participantStore.getSecretChat(CHAT_ID).block();
+            assertNotNull(state);
+            return state;
+        }
     }
 
     @Test
     void bothSidesEndUpWithTheSameKey() {
-        var server = new FakeServer();
-        var initiatorStore = store();
-        var participantStore = store();
-
-        var initiator = manager(server, initiatorStore);
-        var participant = manager(server, participantStore);
+        var chat = new Chat();
 
         // the initiator asks for a chat and gets back something not yet usable
-        var requested = initiator.requestSecretChat(ImmutableBaseInputUser.of(PARTICIPANT, 0)).block();
+        var requested = chat.initiator.requestSecretChat(ImmutableBaseInputUser.of(PARTICIPANT, 0)).block();
         assertNotNull(requested);
         assertEquals(SecretChatState.Status.REQUESTED, requested.status());
         assertNull(requested.key());
@@ -137,22 +194,14 @@ class SecretChatManagerTest {
         assertTrue(requested.creator());
 
         // the participant sees the request and accepts it, which keys its side immediately
-        var accepted = participant.onUpdate(ImmutableEncryptedChatRequested.builder()
-                .id(CHAT_ID)
-                .accessHash(ACCESS_HASH)
-                .date(0)
-                .adminId(INITIATOR)
-                .participantId(PARTICIPANT)
-                .gA(server.gA)
-                .build()).block();
+        var accepted = chat.participant.onUpdate(chat.requested()).block();
         assertNotNull(accepted);
         assertEquals(SecretChatState.Status.READY, accepted.status());
         assertFalse(accepted.creator());
         assertNotNull(accepted.key());
 
         // and the initiator finishes with the exponent it kept
-        var completed = initiator.onUpdate(ImmutableBaseEncryptedChat.of(CHAT_ID, ACCESS_HASH, 0,
-                INITIATOR, PARTICIPANT, server.gB, server.acceptedFingerprint)).block();
+        var completed = chat.initiator.onUpdate(chat.accepted()).block();
         assertNotNull(completed);
         assertEquals(SecretChatState.Status.READY, completed.status());
         assertNotNull(completed.key());
@@ -160,193 +209,245 @@ class SecretChatManagerTest {
 
         assertEquals(accepted.key().id(), completed.key().id());
         assertEquals(accepted.key().value(), completed.key().value());
-
-        // both sides persisted what they derived
-        assertEquals(completed.key().id(), initiatorStore.getSecretChat(CHAT_ID).block().key().id());
-        assertEquals(accepted.key().id(), participantStore.getSecretChat(CHAT_ID).block().key().id());
+        assertEquals(completed.key().id(), chat.initiatorState().key().id());
+        assertEquals(accepted.key().id(), chat.participantState().key().id());
     }
 
-    /** Runs the whole exchange and hands back the two keyed managers. */
-    static Keyed keyed(FakeServer server) {
-        var initiator = manager(server, store());
-        var participant = manager(server, store());
+    @Test
+    void keyingAnnouncesOurLayer() {
+        var chat = new Chat();
+        chat.initiator.requestSecretChat(ImmutableBaseInputUser.of(PARTICIPANT, 0)).block();
 
-        initiator.requestSecretChat(ImmutableBaseInputUser.of(PARTICIPANT, 0)).block();
+        // accepting sends a notifyLayer, which is what tells a peer holding back on MTProto 1.0
+        // that it can stop
+        chat.participant.onUpdate(chat.requested()).block();
+        assertEquals(1, chat.participantServer.outbox.size());
+        assertInstanceOf(EncryptedMessageService.class, chat.participantServer.outbox.get(0));
 
-        // each side announces its layer as soon as it has the key, which spends a sequence
-        // number; a real server hands those over, and so must this
-        server.delivered.clear();
-        participant.onUpdate(ImmutableEncryptedChatRequested.builder()
-                .id(CHAT_ID).accessHash(ACCESS_HASH).date(0)
-                .adminId(INITIATOR).participantId(PARTICIPANT).gA(server.gA)
-                .build()).block();
-        var fromParticipant = List.copyOf(server.delivered);
+        chat.initiator.onUpdate(chat.accepted()).block();
+        chat.settle();
 
-        server.delivered.clear();
-        initiator.onUpdate(ImmutableBaseEncryptedChat.of(CHAT_ID, ACCESS_HASH, 0,
-                INITIATOR, PARTICIPANT, server.gB, server.acceptedFingerprint)).block();
-        var fromInitiator = List.copyOf(server.delivered);
-
-        fromParticipant.forEach(m -> initiator.onNewMessage(m).block());
-        fromInitiator.forEach(m -> participant.onNewMessage(m).block());
-
-        return new Keyed(initiator, participant);
+        assertEquals(SecretChatManager.LAYER, chat.initiatorState().layer());
+        assertEquals(SecretChatManager.LAYER, chat.participantState().layer());
     }
-
-    record Keyed(SecretChatManager initiator, SecretChatManager participant) {}
 
     @Test
     void aMessageWrittenByOneSideReadsOnTheOther() {
-        var server = new FakeServer();
-        var keyed = keyed(server);
+        var chat = new Chat().establish();
 
-        server.delivered.clear();
-        keyed.initiator().sendMessage(CHAT_ID, "hello").block();
-        assertEquals(1, server.delivered.size());
+        chat.initiator.sendMessage(CHAT_ID, "hello").block();
+        assertEquals(1, chat.initiatorServer.outbox.size());
 
-        var received = keyed.participant().onNewMessage(server.delivered.get(0)).block();
+        var received = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0)).block();
         assertInstanceOf(BaseDecryptedMessage.class, received);
         assertEquals("hello", ((BaseDecryptedMessage) received).message());
     }
 
     @Test
     void bothDirectionsWorkAndCountersStayInStep() {
-        var server = new FakeServer();
-        var keyed = keyed(server);
+        var chat = new Chat().establish();
 
         for (int i = 0; i < 8; i++) {
-            server.delivered.clear();
-            keyed.initiator().sendMessage(CHAT_ID, "from initiator " + i).block();
-            var toParticipant = keyed.participant().onNewMessage(server.delivered.get(0)).block();
+            chat.initiatorServer.outbox.clear();
+            chat.initiator.sendMessage(CHAT_ID, "from initiator " + i).block();
+            var toParticipant = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0)).block();
             assertEquals("from initiator " + i, ((BaseDecryptedMessage) toParticipant).message());
 
-            server.delivered.clear();
-            keyed.participant().sendMessage(CHAT_ID, "from participant " + i).block();
-            var toInitiator = keyed.initiator().onNewMessage(server.delivered.get(0)).block();
+            chat.participantServer.outbox.clear();
+            chat.participant.sendMessage(CHAT_ID, "from participant " + i).block();
+            var toInitiator = chat.initiator.onNewMessage(chat.participantServer.outbox.get(0)).block();
             assertEquals("from participant " + i, ((BaseDecryptedMessage) toInitiator).message());
         }
     }
 
     @Test
-    void keyingAnnouncesOurLayer() {
-        var server = new FakeServer();
-        var initiator = manager(server, store());
-        var participantStore = store();
-        var participant = manager(server, participantStore);
-
-        initiator.requestSecretChat(ImmutableBaseInputUser.of(PARTICIPANT, 0)).block();
-
-        // accepting sends a notifyLayer, which is what tells a peer holding back on MTProto 1.0
-        // that it can stop
-        server.delivered.clear();
-        participant.onUpdate(ImmutableEncryptedChatRequested.builder()
-                .id(CHAT_ID).accessHash(ACCESS_HASH).date(0)
-                .adminId(INITIATOR).participantId(PARTICIPANT).gA(server.gA)
-                .build()).block();
-        assertEquals(1, server.delivered.size());
-
-        var notification = server.delivered.get(0);
-        assertInstanceOf(EncryptedMessageService.class, notification);
-
-        initiator.onUpdate(ImmutableBaseEncryptedChat.of(CHAT_ID, ACCESS_HASH, 0,
-                INITIATOR, PARTICIPANT, server.gB, server.acceptedFingerprint)).block();
-
-        // it carries no payload for the caller, but it does raise the layer we credit the peer with
-        assertNull(initiator.onNewMessage(notification).block());
-        var state = initiator.getSecretChats().blockFirst();
-        assertNotNull(state);
-        assertEquals(SecretChatManager.LAYER, state.layer());
-    }
-
-    @Test
     void aRepeatedMessageIsDroppedRatherThanDelivered() {
-        var server = new FakeServer();
-        var keyed = keyed(server);
+        var chat = new Chat().establish();
 
-        server.delivered.clear();
-        keyed.initiator().sendMessage(CHAT_ID, "once").block();
-        var message = server.delivered.get(0);
+        chat.initiator.sendMessage(CHAT_ID, "once").block();
+        var message = chat.initiatorServer.outbox.get(0);
 
-        assertNotNull(keyed.participant().onNewMessage(message).block());
-        assertNull(keyed.participant().onNewMessage(message).block(), "the repeat was delivered");
+        assertNotNull(chat.participant.onNewMessage(message).block());
+        assertNull(chat.participant.onNewMessage(message).block(), "the repeat was delivered");
     }
 
     @Test
     void aMessageArrivingOutOfOrderIsNotDelivered() {
-        var server = new FakeServer();
-        var keyed = keyed(server);
+        var chat = new Chat().establish();
 
-        server.delivered.clear();
-        keyed.initiator().sendMessage(CHAT_ID, "first").block();
-        keyed.initiator().sendMessage(CHAT_ID, "second").block();
-        assertEquals(2, server.delivered.size());
+        chat.initiator.sendMessage(CHAT_ID, "first").block();
+        chat.initiator.sendMessage(CHAT_ID, "second").block();
+        assertEquals(2, chat.initiatorServer.outbox.size());
 
         // the second arrives alone; it must wait rather than be handed over out of order
-        assertNull(keyed.participant().onNewMessage(server.delivered.get(1)).block());
+        assertNull(chat.participant.onNewMessage(chat.initiatorServer.outbox.get(1)).block());
 
-        var first = keyed.participant().onNewMessage(server.delivered.get(0)).block();
+        var first = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0)).block();
         assertEquals("first", ((BaseDecryptedMessage) first).message());
     }
 
     @Test
-    void rejectsAnAcceptanceQuotingTheWrongFingerprint() {
-        var server = new FakeServer();
-        var initiator = manager(server, store());
+    void rekeyingLeavesBothSidesOnTheSameNewKey() {
+        var chat = new Chat().establish();
+        var before = chat.initiatorState();
 
-        initiator.requestSecretChat(ImmutableBaseInputUser.of(PARTICIPANT, 0)).block();
+        chat.initiator.rekey(CHAT_ID).block();
+        chat.settle();
+
+        var initiator = chat.initiatorState();
+        var participant = chat.participantState();
+
+        assertEquals(RekeyState.Status.IDLE, initiator.rekey().status());
+        assertEquals(RekeyState.Status.IDLE, participant.rekey().status());
+        assertEquals(initiator.key().id(), participant.key().id(), "the two sides hold different keys");
+        assertNotEquals(before.key().id(), initiator.key().id(), "the key did not actually change");
+        assertEquals(before.key().id(), initiator.oldKey().id(), "the replaced key was not kept");
+    }
+
+    @Test
+    void messagesKeepFlowingAcrossAReplacement() {
+        var chat = new Chat().establish();
+
+        chat.initiator.rekey(CHAT_ID).block();
+        chat.settle();
+
+        chat.initiatorServer.outbox.clear();
+        chat.initiator.sendMessage(CHAT_ID, "after rekey").block();
+        var received = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0)).block();
+        assertEquals("after rekey", ((BaseDecryptedMessage) received).message());
+
+        chat.participantServer.outbox.clear();
+        chat.participant.sendMessage(CHAT_ID, "and back").block();
+        var back = chat.initiator.onNewMessage(chat.participantServer.outbox.get(0)).block();
+        assertEquals("and back", ((BaseDecryptedMessage) back).message());
+    }
+
+    @Test
+    void aMessageSentUnderTheOldKeyStillReads() {
+        var chat = new Chat().establish();
+
+        // the two sides do not switch at the same moment: the initiator installs the new key as
+        // it sends the commit, and the participant only when that commit arrives. Anything the
+        // participant writes in between is still under the old key
+        chat.initiator.rekey(CHAT_ID).block();
+        var requestKey = chat.initiatorServer.outbox.remove(0);
+
+        chat.participant.onNewMessage(requestKey).block();
+        var acceptKey = chat.participantServer.outbox.remove(0);
+
+        chat.participant.sendMessage(CHAT_ID, "in flight").block();
+        var inFlight = chat.participantServer.outbox.remove(0);
+
+        chat.initiator.onNewMessage(acceptKey).block();
+        assertNotNull(chat.initiatorState().oldKey(), "the initiator did not keep the key it replaced");
+
+        var received = chat.initiator.onNewMessage(inFlight).block();
+        assertEquals("in flight", ((BaseDecryptedMessage) received).message());
+    }
+
+    @Test
+    void simultaneousRequestsLeaveOneWinner() {
+        var chat = new Chat().establish();
+
+        // both sides ask at once, and neither has heard the other yet
+        chat.initiator.rekey(CHAT_ID).block();
+        chat.participant.rekey(CHAT_ID).block();
+        chat.settle();
+
+        var initiator = chat.initiatorState();
+        var participant = chat.participantState();
+
+        // whoever won, the two must agree on the key and neither may be left mid-exchange
+        assertEquals(RekeyState.Status.IDLE, initiator.rekey().status());
+        assertEquals(RekeyState.Status.IDLE, participant.rekey().status());
+        assertEquals(initiator.key().id(), participant.key().id());
+    }
+
+    @Test
+    void aWornKeyIsReplacedWithoutBeingAsked() {
+        var chat = new Chat().establish();
+        var original = chat.initiatorState().key().id();
+
+        // the key is good for a hundred messages, and nothing outside the manager is expected
+        // to count them
+        for (int i = 0; i < SecretChatState.DEFAULT_MESSAGES_PER_KEY; i++) {
+            chat.participant.sendMessage(CHAT_ID, "message " + i).block();
+            chat.settle();
+        }
+
+        var initiator = chat.initiatorState();
+        var participant = chat.participantState();
+
+        assertNotEquals(original, initiator.key().id(), "the key was never replaced");
+        assertEquals(initiator.key().id(), participant.key().id());
+        assertEquals(RekeyState.Status.IDLE, initiator.rekey().status());
+        assertEquals(RekeyState.Status.IDLE, participant.rekey().status());
+
+        // and the chat still works afterwards
+        chat.initiatorServer.outbox.clear();
+        chat.initiator.sendMessage(CHAT_ID, "still here").block();
+        var received = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0)).block();
+        assertEquals("still here", ((BaseDecryptedMessage) received).message());
+    }
+
+    @Test
+    void aChatNobodyAnswersStillReplacesItsKey() {
+        var chat = new Chat().establish();
+        var original = chat.initiatorState().key().id();
+
+        // only the initiator ever speaks, so a check that runs only on incoming messages would
+        // never fire
+        for (int i = 0; i < SecretChatState.DEFAULT_MESSAGES_PER_KEY; i++) {
+            chat.initiator.sendMessage(CHAT_ID, "message " + i).block();
+            chat.settle();
+        }
+
+        assertNotEquals(original, chat.initiatorState().key().id(), "the key was never replaced");
+        assertEquals(chat.initiatorState().key().id(), chat.participantState().key().id());
+    }
+
+    @Test
+    void rejectsAnAcceptanceQuotingTheWrongFingerprint() {
+        var chat = new Chat();
+        chat.initiator.requestSecretChat(ImmutableBaseInputUser.of(PARTICIPANT, 0)).block();
 
         var e = assertThrows(SecretChatException.class,
-                () -> initiator.onUpdate(ImmutableBaseEncryptedChat.of(CHAT_ID, ACCESS_HASH, 0,
-                        INITIATOR, PARTICIPANT, server.gA, 0xdeadbeefL)).block());
+                () -> chat.initiator.onUpdate(ImmutableBaseEncryptedChat.of(CHAT_ID, ACCESS_HASH, 0,
+                        INITIATOR, PARTICIPANT, chat.world.gA, 0xdeadbeefL)).block());
         assertTrue(e.getMessage().startsWith("Key fingerprint mismatch"), e.getMessage());
     }
 
     @Test
     void ignoresARepeatedAcceptance() {
-        var server = new FakeServer();
-        var initiator = manager(server, store());
-        var participant = manager(server, store());
+        var chat = new Chat();
+        chat.initiator.requestSecretChat(ImmutableBaseInputUser.of(PARTICIPANT, 0)).block();
+        chat.participant.onUpdate(chat.requested()).block();
 
-        initiator.requestSecretChat(ImmutableBaseInputUser.of(PARTICIPANT, 0)).block();
-        participant.onUpdate(ImmutableEncryptedChatRequested.builder()
-                .id(CHAT_ID).accessHash(ACCESS_HASH).date(0)
-                .adminId(INITIATOR).participantId(PARTICIPANT).gA(server.gA)
-                .build()).block();
-
-        var acceptance = ImmutableBaseEncryptedChat.of(CHAT_ID, ACCESS_HASH, 0,
-                INITIATOR, PARTICIPANT, server.gB, server.acceptedFingerprint);
-        var first = initiator.onUpdate(acceptance).block();
-        assertNotNull(first);
-
+        assertNotNull(chat.initiator.onUpdate(chat.accepted()).block());
         // the same update again must not rerun the exchange against a spent exponent
-        assertNull(initiator.onUpdate(acceptance).block());
+        assertNull(chat.initiator.onUpdate(chat.accepted()).block());
     }
 
     @Test
     void discardingForgetsTheChat() {
-        var server = new FakeServer();
-        var store = store();
-        var initiator = manager(server, store);
+        var chat = new Chat();
+        chat.initiator.requestSecretChat(ImmutableBaseInputUser.of(PARTICIPANT, 0)).block();
+        chat.initiator.discardSecretChat(CHAT_ID, true).block();
 
-        initiator.requestSecretChat(ImmutableBaseInputUser.of(PARTICIPANT, 0)).block();
-        initiator.discardSecretChat(CHAT_ID, true).block();
-
-        assertTrue(server.discarded);
-        assertNull(store.getSecretChat(CHAT_ID).block());
+        assertTrue(chat.world.discarded);
+        assertNull(chat.initiatorStore.getSecretChat(CHAT_ID).block());
     }
 
     @Test
     void aChatDiscardedByThePeerIsKeptAsDiscarded() {
-        var server = new FakeServer();
-        var store = store();
-        var initiator = manager(server, store);
+        var chat = new Chat();
+        chat.initiator.requestSecretChat(ImmutableBaseInputUser.of(PARTICIPANT, 0)).block();
 
-        initiator.requestSecretChat(ImmutableBaseInputUser.of(PARTICIPANT, 0)).block();
-        var state = initiator.onUpdate(ImmutableEncryptedChatDiscarded.builder().id(CHAT_ID).build()).block();
-
+        var state = chat.initiator.onUpdate(
+                ImmutableEncryptedChatDiscarded.builder().id(CHAT_ID).build()).block();
         assertNotNull(state);
         assertEquals(SecretChatState.Status.DISCARDED, state.status());
         // kept rather than deleted, so a late message is dropped instead of starting a new chat
-        assertNotNull(store.getSecretChat(CHAT_ID).block());
+        assertNotNull(chat.initiatorStore.getSecretChat(CHAT_ID).block());
     }
 }
