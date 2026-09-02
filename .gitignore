@@ -6,3 +6,5 @@ logs
 /core/src/test/resources/t4j.bin
 /core/src/test/resources/t4j-bot.bin
 /core/src/test/resources/stash
+
+secret-chat-console-*.bin

@@ -136,13 +136,13 @@ public final class SeqNoState {
      *
      * @param inSeqNo the {@code in_seq_no} of the received {@code decryptedMessageLayer}.
      * @param outSeqNo the {@code out_seq_no} of the received {@code decryptedMessageLayer}.
-     * <p> Rejecting an acknowledgement lower than the last one is only sound while messages
-     * reach here in the order the peer sent them: a message overtaken in transit legitimately
-     * carries a staler view of our progress than one already processed. Until gaps are held and
-     * refilled, a reordered message therefore fails this check rather than being queued.
+     * <p> Messages reach here in whatever order they arrived, so what the peer reports about our
+     * progress is taken as the highest value seen rather than the latest one. Only a claim to
+     * have processed more than we ever sent is a violation; a lower one is just an older message
+     * catching up.
      *
      * @throws SecretChatException if the values do not belong to the peer, or if the peer claims
-     * to have processed messages we never sent, or fewer than it claimed before.
+     * to have processed messages we never sent.
      * @return The classification, the raw sequence number, and the counters that follow.
      */
     public Incoming accept(int inSeqNo, int outSeqNo) {
@@ -158,27 +158,28 @@ public final class SeqNoState {
         int remoteIn = (inSeqNo - outBase) / 2;
         int seqNo = (outSeqNo - inBase) / 2;
 
-        if (remoteIn < remoteInSeqNo) {
-            throw new SecretChatException("in_seq_no is decreasing: "
-                    + remoteIn + " < " + remoteInSeqNo);
-        }
         // The peer may already count the message it is replying to, hence the one of slack
         if (remoteIn > this.outSeqNo + 1) {
             throw new SecretChatException("in_seq_no is bigger than the number of sent messages: "
                     + remoteIn + " > " + this.outSeqNo);
         }
+        // A message overtaken in transit carries a staler view of our progress than one already
+        // processed, so the newest report wins rather than the last one to arrive. Treating a
+        // lower value as a protocol violation rejects perfectly ordinary reordering, and rejects
+        // it before the message can be held, which loses it outright
+        int acknowledged = Math.max(remoteInSeqNo, remoteIn);
 
         if (seqNo < this.inSeqNo) {
             return new Incoming(Status.REPEATED, seqNo,
-                    new SeqNoState(creator, this.inSeqNo, this.outSeqNo, remoteIn));
+                    new SeqNoState(creator, this.inSeqNo, this.outSeqNo, acknowledged));
         }
         if (seqNo > this.inSeqNo) {
             return new Incoming(Status.GAP, seqNo,
-                    new SeqNoState(creator, this.inSeqNo, this.outSeqNo, remoteIn));
+                    new SeqNoState(creator, this.inSeqNo, this.outSeqNo, acknowledged));
         }
 
         return new Incoming(Status.EXPECTED, seqNo,
-                new SeqNoState(creator, this.inSeqNo + 1, this.outSeqNo, remoteIn));
+                new SeqNoState(creator, this.inSeqNo + 1, this.outSeqNo, acknowledged));
     }
 
     /**

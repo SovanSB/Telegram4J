@@ -40,6 +40,7 @@ import telegram4j.tl.request.messages.SendEncryptedService;
 import telegram4j.tl.secret.BaseDecryptedMessage;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -54,6 +55,8 @@ class SecretChatManagerTest {
     static final long PARTICIPANT = 2222L;
     static final int CHAT_ID = 4242;
     static final long ACCESS_HASH = 0x1122334455667788L;
+    /** Mirrors {@code SecretChatManager.MAX_HELD_MESSAGES}, which is not visible from here. */
+    static final int MAX_HELD = 100;
 
     /** What the two sides agree on through the server rather than through the chat. */
     static final class World {
@@ -160,11 +163,11 @@ class SecretChatManagerTest {
             while (!initiatorServer.outbox.isEmpty() || !participantServer.outbox.isEmpty()) {
                 var toParticipant = List.copyOf(initiatorServer.outbox);
                 initiatorServer.outbox.clear();
-                toParticipant.forEach(m -> participant.onNewMessage(m).block());
+                toParticipant.forEach(m -> participant.onNewMessage(m).blockFirst());
 
                 var toInitiator = List.copyOf(participantServer.outbox);
                 participantServer.outbox.clear();
-                toInitiator.forEach(m -> initiator.onNewMessage(m).block());
+                toInitiator.forEach(m -> initiator.onNewMessage(m).blockFirst());
             }
         }
 
@@ -238,7 +241,7 @@ class SecretChatManagerTest {
         chat.initiator.sendMessage(CHAT_ID, "hello").block();
         assertEquals(1, chat.initiatorServer.outbox.size());
 
-        var received = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0)).block();
+        var received = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0)).blockFirst();
         assertInstanceOf(BaseDecryptedMessage.class, received);
         assertEquals("hello", ((BaseDecryptedMessage) received).message());
     }
@@ -250,12 +253,12 @@ class SecretChatManagerTest {
         for (int i = 0; i < 8; i++) {
             chat.initiatorServer.outbox.clear();
             chat.initiator.sendMessage(CHAT_ID, "from initiator " + i).block();
-            var toParticipant = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0)).block();
+            var toParticipant = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0)).blockFirst();
             assertEquals("from initiator " + i, ((BaseDecryptedMessage) toParticipant).message());
 
             chat.participantServer.outbox.clear();
             chat.participant.sendMessage(CHAT_ID, "from participant " + i).block();
-            var toInitiator = chat.initiator.onNewMessage(chat.participantServer.outbox.get(0)).block();
+            var toInitiator = chat.initiator.onNewMessage(chat.participantServer.outbox.get(0)).blockFirst();
             assertEquals("from participant " + i, ((BaseDecryptedMessage) toInitiator).message());
         }
     }
@@ -267,8 +270,8 @@ class SecretChatManagerTest {
         chat.initiator.sendMessage(CHAT_ID, "once").block();
         var message = chat.initiatorServer.outbox.get(0);
 
-        assertNotNull(chat.participant.onNewMessage(message).block());
-        assertNull(chat.participant.onNewMessage(message).block(), "the repeat was delivered");
+        assertNotNull(chat.participant.onNewMessage(message).blockFirst());
+        assertNull(chat.participant.onNewMessage(message).blockFirst(), "the repeat was delivered");
     }
 
     @Test
@@ -280,10 +283,157 @@ class SecretChatManagerTest {
         assertEquals(2, chat.initiatorServer.outbox.size());
 
         // the second arrives alone; it must wait rather than be handed over out of order
-        assertNull(chat.participant.onNewMessage(chat.initiatorServer.outbox.get(1)).block());
+        assertNull(chat.participant.onNewMessage(chat.initiatorServer.outbox.get(1)).blockFirst());
 
-        var first = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0)).block();
+        var first = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0)).blockFirst();
         assertEquals("first", ((BaseDecryptedMessage) first).message());
+    }
+
+    @Test
+    void aMessageHeldBehindAGapIsDeliveredOnceItIsFilled() {
+        var chat = new Chat().establish();
+
+        chat.initiator.sendMessage(CHAT_ID, "first").block();
+        chat.initiator.sendMessage(CHAT_ID, "second").block();
+        var first = chat.initiatorServer.outbox.get(0);
+        var second = chat.initiatorServer.outbox.get(1);
+
+        // the second overtakes the first: held, not dropped, and the peer is asked for what is
+        // missing rather than the chat being left to die on the gap
+        assertNull(chat.participant.onNewMessage(second).blockFirst());
+        assertFalse(chat.participantServer.outbox.isEmpty(), "no resend was requested");
+
+        // and when the first arrives, both come out, in the order they were sent
+        var delivered = chat.participant.onNewMessage(first)
+                .cast(BaseDecryptedMessage.class)
+                .map(BaseDecryptedMessage::message)
+                .collectList()
+                .block();
+        assertEquals(List.of("first", "second"), delivered);
+    }
+
+    @Test
+    void resendRequestsAreCappedSoTwoStuckClientsCannotLoop() {
+        var chat = new Chat().establish();
+
+        // twenty messages pile up behind one that never arrives
+        chat.initiator.sendMessage(CHAT_ID, "lost").block();
+        for (int i = 0; i < 20; i++) {
+            chat.initiator.sendMessage(CHAT_ID, "held " + i).block();
+        }
+
+        chat.participantServer.outbox.clear();
+        for (int i = 1; i <= 20; i++) {
+            assertNull(chat.participant.onNewMessage(chat.initiatorServer.outbox.get(i)).blockFirst());
+        }
+
+        // every one of them is held, but the peer is asked a handful of times rather than twenty:
+        // each request covers a wider range than the last, and once the cap is reached the chat
+        // stops asking until something arrives in order
+        assertTrue(chat.participantServer.outbox.size() <= 3,
+                "sent " + chat.participantServer.outbox.size() + " resend requests");
+
+        // and nothing was lost by staying quiet: filling the gap still releases everything
+        var delivered = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0))
+                .cast(BaseDecryptedMessage.class)
+                .map(BaseDecryptedMessage::message)
+                .collectList()
+                .block();
+        assertEquals(21, delivered.size());
+        assertEquals("lost", delivered.get(0));
+        assertEquals("held 19", delivered.get(20));
+    }
+
+    @Test
+    void messagesArrivingBackwardsAreAllDelivered() {
+        var chat = new Chat().establish();
+
+        // the initiator answers its own progress in each message, so the later ones report more
+        // than the earlier ones; delivered newest first, the older reports must not be taken for
+        // the peer going backwards
+        for (int i = 0; i < 5; i++) {
+            chat.participant.sendMessage(CHAT_ID, "ignored " + i).block();
+            chat.initiator.onNewMessage(chat.participantServer.outbox.remove(0)).blockFirst();
+            chat.initiator.sendMessage(CHAT_ID, "message " + i).block();
+        }
+        assertEquals(5, chat.initiatorServer.outbox.size());
+
+        var backwards = new ArrayList<>(chat.initiatorServer.outbox);
+        Collections.reverse(backwards);
+
+        var delivered = new ArrayList<String>();
+        for (var message : backwards) {
+            chat.participant.onNewMessage(message)
+                    .cast(BaseDecryptedMessage.class)
+                    .map(BaseDecryptedMessage::message)
+                    .doOnNext(delivered::add)
+                    .blockLast();
+        }
+
+        // nothing was lost and nothing was reordered
+        assertEquals(List.of("message 0", "message 1", "message 2", "message 3", "message 4"),
+                delivered);
+    }
+
+    @Test
+    void aChatWillNotHoldMoreThanItsShare() {
+        var chat = new Chat().establish();
+
+        // a peer whose first message went missing keeps talking, and every one of those is held
+        chat.initiator.sendMessage(CHAT_ID, "lost").block();
+        for (int i = 0; i < 150; i++) {
+            chat.initiator.sendMessage(CHAT_ID, "held " + i).block();
+        }
+
+        chat.participantServer.outbox.clear();
+        for (int i = 1; i < chat.initiatorServer.outbox.size(); i++) {
+            assertNull(chat.participant.onNewMessage(chat.initiatorServer.outbox.get(i)).blockFirst());
+        }
+
+        // filling the hole releases what was kept, and no more than the cap allows
+        var delivered = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0))
+                .cast(BaseDecryptedMessage.class)
+                .map(BaseDecryptedMessage::message)
+                .collectList()
+                .block();
+        assertNotNull(delivered);
+        // the hole itself plus at most a cap's worth, and a hundred and fifty were offered.
+        // Not an exact count: this many messages wears the key out, and the rekey that starts
+        // takes a sequence number of its own without carrying anything to deliver
+        assertTrue(delivered.size() <= MAX_HELD + 1,
+                "released " + delivered.size() + ", held more than the cap allows");
+        assertTrue(delivered.size() >= MAX_HELD,
+                "released " + delivered.size() + ", held fewer than the cap allows");
+
+        // and what it kept is the run nearest the hole, in order
+        assertEquals("lost", delivered.get(0));
+        assertEquals("held 0", delivered.get(1));
+        assertEquals("held 1", delivered.get(2));
+    }
+
+    @Test
+    void aGapCanBeGivenUpOnWhenNobodyWillResend() {
+        var chat = new Chat().establish();
+
+        chat.initiator.sendMessage(CHAT_ID, "lost").block();
+        chat.initiator.sendMessage(CHAT_ID, "arrived").block();
+        var arrived = chat.initiatorServer.outbox.get(1);
+
+        assertNull(chat.participant.onNewMessage(arrived).blockFirst());
+
+        // the peer is TDLib and will never answer the resend, so the hole has to be stepped over
+        var released = chat.participant.skipGap(CHAT_ID)
+                .cast(BaseDecryptedMessage.class)
+                .map(BaseDecryptedMessage::message)
+                .collectList()
+                .block();
+        assertEquals(List.of("arrived"), released);
+
+        // and the chat works again afterwards
+        chat.initiatorServer.outbox.clear();
+        chat.initiator.sendMessage(CHAT_ID, "after").block();
+        var next = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0)).blockFirst();
+        assertEquals("after", ((BaseDecryptedMessage) next).message());
     }
 
     @Test
@@ -313,12 +463,12 @@ class SecretChatManagerTest {
 
         chat.initiatorServer.outbox.clear();
         chat.initiator.sendMessage(CHAT_ID, "after rekey").block();
-        var received = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0)).block();
+        var received = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0)).blockFirst();
         assertEquals("after rekey", ((BaseDecryptedMessage) received).message());
 
         chat.participantServer.outbox.clear();
         chat.participant.sendMessage(CHAT_ID, "and back").block();
-        var back = chat.initiator.onNewMessage(chat.participantServer.outbox.get(0)).block();
+        var back = chat.initiator.onNewMessage(chat.participantServer.outbox.get(0)).blockFirst();
         assertEquals("and back", ((BaseDecryptedMessage) back).message());
     }
 
@@ -332,16 +482,16 @@ class SecretChatManagerTest {
         chat.initiator.rekey(CHAT_ID).block();
         var requestKey = chat.initiatorServer.outbox.remove(0);
 
-        chat.participant.onNewMessage(requestKey).block();
+        chat.participant.onNewMessage(requestKey).blockFirst();
         var acceptKey = chat.participantServer.outbox.remove(0);
 
         chat.participant.sendMessage(CHAT_ID, "in flight").block();
         var inFlight = chat.participantServer.outbox.remove(0);
 
-        chat.initiator.onNewMessage(acceptKey).block();
+        chat.initiator.onNewMessage(acceptKey).blockFirst();
         assertNotNull(chat.initiatorState().oldKey(), "the initiator did not keep the key it replaced");
 
-        var received = chat.initiator.onNewMessage(inFlight).block();
+        var received = chat.initiator.onNewMessage(inFlight).blockFirst();
         assertEquals("in flight", ((BaseDecryptedMessage) received).message());
     }
 
@@ -386,7 +536,7 @@ class SecretChatManagerTest {
         // and the chat still works afterwards
         chat.initiatorServer.outbox.clear();
         chat.initiator.sendMessage(CHAT_ID, "still here").block();
-        var received = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0)).block();
+        var received = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0)).blockFirst();
         assertEquals("still here", ((BaseDecryptedMessage) received).message());
     }
 

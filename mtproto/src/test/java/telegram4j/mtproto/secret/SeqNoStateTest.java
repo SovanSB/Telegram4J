@@ -161,9 +161,11 @@ class SeqNoStateTest {
         var accepted = creator.accept(5, 0);
         assertEquals(Status.EXPECTED, accepted.status());
 
-        // going backwards afterwards is a protocol violation
-        var e = assertThrowsExactly(SecretChatException.class, () -> accepted.next().accept(1, 2));
-        assertTrue(e.getMessage().startsWith("in_seq_no is decreasing"), e.getMessage());
+        // an older message catching up reports less, which is ordinary reordering rather than a
+        // violation: the highest report stands, and the message is still classified
+        var late = accepted.next().accept(1, 2);
+        assertEquals(Status.EXPECTED, late.status());
+        assertEquals(2, late.next().remoteInSeqNo(), "an older report must not roll the peer back");
     }
 
     @Test
