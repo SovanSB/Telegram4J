@@ -22,6 +22,8 @@ import telegram4j.mtproto.auth.AuthorizationException;
 import telegram4j.mtproto.auth.DhParameters;
 
 import java.math.BigInteger;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 
 /**
  * The Diffie-Hellman half of establishing a secret chat, with no I/O of its own.
@@ -38,6 +40,38 @@ import java.math.BigInteger;
 public final class SecretChatKeyExchange {
 
     private SecretChatKeyExchange() {
+    }
+
+    /** Length of what {@link #keyHash(AuthKey)} produces. */
+    public static final int KEY_HASH_SIZE = 36;
+
+    /**
+     * The bytes clients show as the chat's encryption key, for the two people to read out to each
+     * other and be sure nobody sits in between.
+     *
+     * <p> 128 bits of SHA-1 over the key, which is the original scheme, followed by 160 bits of
+     * SHA-256, which layer 46 added. Apps show the first 32 bytes of it.
+     *
+     * <p> Computed once, from the key the chat started with, and kept unchanged when that key is
+     * later replaced: a value that moved every hundred messages would have to be verified again
+     * every hundred messages, which defeats the point of verifying it. TDLib computes it in the
+     * same two places and nowhere else, both of them in the initial exchange.
+     */
+    public static byte[] keyHash(AuthKey key) {
+        byte[] value = ByteBufUtil.getBytes(key.value());
+
+        byte[] hash = new byte[KEY_HASH_SIZE];
+        System.arraycopy(digest("SHA-1", value), 0, hash, 0, 16);
+        System.arraycopy(digest("SHA-256", value), 0, hash, 16, 20);
+        return hash;
+    }
+
+    private static byte[] digest(String algorithm, byte[] value) {
+        try {
+            return MessageDigest.getInstance(algorithm).digest(value);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("Missing " + algorithm, e);
+        }
     }
 
     /**

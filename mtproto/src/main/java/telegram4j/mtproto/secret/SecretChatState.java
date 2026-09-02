@@ -73,6 +73,8 @@ public final class SecretChatState {
     private final AuthKey oldKey;
     @Nullable
     private final Instant keyCreatedAt;
+    @Nullable
+    private final byte[] keyHash;
     private final int remainingMessages;
     private final int layer;
     private final int ttl;
@@ -88,6 +90,7 @@ public final class SecretChatState {
         this.key = builder.key;
         this.oldKey = builder.oldKey;
         this.keyCreatedAt = builder.keyCreatedAt;
+        this.keyHash = builder.keyHash;
         this.remainingMessages = builder.remainingMessages;
         this.layer = builder.layer;
         this.ttl = builder.ttl;
@@ -160,6 +163,19 @@ public final class SecretChatState {
         return keyCreatedAt;
     }
 
+    /**
+     * {@return What clients show as this chat's encryption key, for two people to compare}
+     *
+     * <p> Fixed for the life of the chat: it comes from the key the chat started with and does
+     * not follow later replacements, so a comparison made once stays valid.
+     *
+     * @see SecretChatKeyExchange#keyHash(AuthKey)
+     */
+    @Nullable
+    public byte[] keyHash() {
+        return keyHash == null ? null : keyHash.clone();
+    }
+
     /** {@return How many more messages this key may carry before it must be replaced} */
     public int remainingMessages() {
         return remainingMessages;
@@ -210,6 +226,8 @@ public final class SecretChatState {
         private AuthKey oldKey;
         @Nullable
         private Instant keyCreatedAt;
+        @Nullable
+        private byte[] keyHash;
         private int remainingMessages = DEFAULT_MESSAGES_PER_KEY;
         private int layer = DEFAULT_LAYER;
         private int ttl;
@@ -232,6 +250,7 @@ public final class SecretChatState {
             this.key = state.key;
             this.oldKey = state.oldKey;
             this.keyCreatedAt = state.keyCreatedAt;
+            this.keyHash = state.keyHash;
             this.remainingMessages = state.remainingMessages;
             this.layer = state.layer;
             this.ttl = state.ttl;
@@ -266,6 +285,16 @@ public final class SecretChatState {
             this.keyCreatedAt = Objects.requireNonNull(createdAt);
             this.remainingMessages = DEFAULT_MESSAGES_PER_KEY;
             this.secret = null;
+            // only the key the chat started with decides what the two people compare
+            if (this.keyHash == null) {
+                this.keyHash = SecretChatKeyExchange.keyHash(key);
+            }
+            return this;
+        }
+
+        /** Restores the hash as stored, for a chat read back from storage. */
+        public Builder keyHash(@Nullable byte[] keyHash) {
+            this.keyHash = keyHash == null ? null : keyHash.clone();
             return this;
         }
 

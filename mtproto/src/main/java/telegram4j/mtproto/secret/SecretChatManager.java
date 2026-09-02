@@ -566,7 +566,7 @@ public final class SecretChatManager {
                         .rekey(RekeyState.requested(exchangeId, secret))
                         .build();
 
-                log.debug("Requesting a new key for secret chat {}, exchange 0x{}",
+                log.info("Requesting a new key for secret chat {}, exchange 0x{}",
                         chatId, Long.toHexString(exchangeId));
                 return sendService(next, ImmutableDecryptedMessageActionRequestKey.of(exchangeId, gA));
             });
@@ -599,7 +599,7 @@ public final class SecretChatManager {
                     .rekey(RekeyState.accepted(exchangeId, pendingKey))
                     .build();
 
-            log.debug("Accepting a new key for secret chat {}, exchange 0x{}",
+            log.info("Accepting a new key for secret chat {}, exchange 0x{}",
                     state.id(), Long.toHexString(exchangeId));
             return sendService(next, ImmutableDecryptedMessageActionAcceptKey.of(
                     exchangeId, gB, pendingKey.id()));
@@ -637,7 +637,8 @@ public final class SecretChatManager {
                     .rekey(RekeyState.idle())
                     .build();
 
-            log.debug("Committing the new key of secret chat {}", state.id());
+            log.info("Committing the new key of secret chat {}, fingerprint 0x{}", state.id(),
+                    Long.toHexString(replacement.id()));
             return sendService(next, ImmutableDecryptedMessageActionCommitKey.of(
                     exchangeId, replacement.id()), state.key());
         });
@@ -667,7 +668,8 @@ public final class SecretChatManager {
                 .build();
 
         // a message under the new key, so the peer sees the switch took effect
-        log.debug("Secret chat {} now uses its replacement key", state.id());
+        log.info("Secret chat {} now uses its replacement key, fingerprint 0x{}", state.id(),
+                Long.toHexString(pendingKey.id()));
         return sendService(next, DecryptedMessageActionNoop.instance());
     }
 

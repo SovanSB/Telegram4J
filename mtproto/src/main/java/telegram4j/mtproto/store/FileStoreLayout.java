@@ -16,6 +16,7 @@
 package telegram4j.mtproto.store;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import io.netty.util.NetUtil;
 import reactor.core.publisher.Flux;
@@ -109,6 +110,7 @@ public class FileStoreLayout implements StoreLayout, SecretChatStore {
     protected static final byte SECRET_SET     = 0b0010;
     protected static final byte KEY_SET        = 0b0100;
     protected static final byte OLD_KEY_SET    = 0b1000;
+    protected static final byte KEY_HASH_SET   = 0b10000;
 
     protected static void serializeSecretChat(ByteBuf buf, SecretChatState c) {
         buf.writeIntLE(c.id());
@@ -121,11 +123,13 @@ public class FileStoreLayout implements StoreLayout, SecretChatStore {
         flags |= c.secret() != null ? SECRET_SET : 0;
         flags |= c.key() != null ? KEY_SET : 0;
         flags |= c.oldKey() != null ? OLD_KEY_SET : 0;
+        flags |= c.keyHash() != null ? KEY_HASH_SET : 0;
         buf.writeByte(flags);
 
         if (c.secret() != null) TlSerialUtil.serializeBytes(buf, toByteBuf(c.secret()));
         if (c.key() != null) TlSerialUtil.serializeBytes(buf, c.key().value());
         if (c.oldKey() != null) TlSerialUtil.serializeBytes(buf, c.oldKey().value());
+        if (c.keyHash() != null) TlSerialUtil.serializeBytes(buf, Unpooled.wrappedBuffer(c.keyHash()));
 
         buf.writeLongLE(c.keyCreatedAt() != null ? c.keyCreatedAt().getEpochSecond() : 0);
         buf.writeIntLE(c.remainingMessages());
@@ -161,6 +165,8 @@ public class FileStoreLayout implements StoreLayout, SecretChatStore {
                 ? CryptoUtil.fromByteBuf(TlSerialUtil.deserializeBytes(buf).retain()) : null;
         AuthKey key = (flags & KEY_SET) != 0 ? new AuthKey(TlSerialUtil.deserializeBytes(buf)) : null;
         AuthKey oldKey = (flags & OLD_KEY_SET) != 0 ? new AuthKey(TlSerialUtil.deserializeBytes(buf)) : null;
+        byte[] keyHash = (flags & KEY_HASH_SET) != 0
+                ? ByteBufUtil.getBytes(TlSerialUtil.deserializeBytes(buf)) : null;
 
         long keyCreatedAt = buf.readLongLE();
         int remainingMessages = buf.readIntLE();
@@ -179,7 +185,8 @@ public class FileStoreLayout implements StoreLayout, SecretChatStore {
                 .remainingMessages(remainingMessages)
                 .layer(layer)
                 .ttl(ttl)
-                .seqNo(seqNo);
+                .seqNo(seqNo)
+                .keyHash(keyHash);
 
         var rekeyStatus = RekeyState.Status.values()[buf.readUnsignedByte()];
         if (rekeyStatus != RekeyState.Status.IDLE) {
