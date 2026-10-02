@@ -149,8 +149,13 @@ class SecretChatManagerTest {
         }
 
         Chat(int outboxCapacity) {
-            initiatorOutbox = new SecretChatOutboxImpl(outboxCapacity);
-            participantOutbox = new SecretChatOutboxImpl(outboxCapacity);
+            this(new SecretChatOutboxImpl(outboxCapacity),
+                new SecretChatOutboxImpl(outboxCapacity));
+        }
+
+        Chat(SecretChatOutbox initiatorOutbox, SecretChatOutbox participantOutbox) {
+            this.initiatorOutbox = initiatorOutbox;
+            this.participantOutbox = participantOutbox;
             initiator = new SecretChatManager(new ChatService(initiatorServer, initiatorStore),
                     initiatorStore, DhPrimeCheckerCache.instance(), false, initiatorOutbox);
             participant = new SecretChatManager(new ChatService(participantServer, participantStore),
@@ -704,19 +709,38 @@ class SecretChatManagerTest {
         assertEquals(asked, standIn.outSeqNo(), "stood in for a number the peer never asked about");
     }
 
+    /**
+     * An outbox which quietly loses one message, which is what a hole looks like from our side:
+     * the counter moved on, so the peer will ask about it, and there is nothing to answer with.
+     *
+     * <p> Eviction cannot stand in for this. It drops the oldest first, so what is kept is always
+     * a run with no holes inside it, and the message before a hole is gone along with it.
+     */
+    static final class LosingOutbox extends SecretChatOutboxImpl {
+        final int lost;
+
+        LosingOutbox(int lost) {
+            this.lost = lost;
+        }
+
+        @Override
+        public Mono<Void> add(int chatId, Sent message) {
+            return message.outSeqNo() == lost ? Mono.empty() : super.add(chatId, message);
+        }
+    }
+
     @Test
     void aStandInCopiesTheNeighbourOfTheHoleAndNothingFurther() {
-        var chat = new Chat().establish();
-        chat.initiator.sendMessage(CHAT_ID, "before the hole").block();
-
-        // the hole itself, kept nowhere, and then several more so that the outbox holds messages
-        // well past it as well as the one right before it
-        var seqNo = chat.initiatorState().seqNo();
-        int hole = seqNo.toWireSeqNo(seqNo.outSeqNo());
-        chat.initiator.stageMessage(CHAT_ID, "lost", false).block();
-        for (int i = 0; i < 3; i++) {
-            chat.initiator.sendMessage(CHAT_ID, "after the hole " + i).block();
+        // keying spends the first number, so the second message sent after it lands on wire 5
+        int hole = 5;
+        var chat = new Chat(new LosingOutbox(hole), new SecretChatOutboxImpl()).establish();
+        for (int i = 0; i < 4; i++) {
+            chat.initiator.sendMessage(CHAT_ID, "message " + i).block();
         }
+
+        var seqNo = chat.initiatorState().seqNo();
+        assertEquals(hole, seqNo.toWireSeqNo(2), "the hole is not where this test expects it");
+        assertNull(chat.initiatorOutbox.get(CHAT_ID, hole).block(), "the hole was kept after all");
 
         var before = chat.initiatorOutbox.get(CHAT_ID, hole - 2).block();
         var after = chat.initiatorOutbox.get(CHAT_ID, hole + 2).block();

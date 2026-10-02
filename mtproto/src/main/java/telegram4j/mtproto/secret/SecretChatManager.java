@@ -279,63 +279,6 @@ public final class SecretChatManager {
     }
 
     /**
-     * Allocates a sequence number and encrypts a message under it, then keeps it instead of
-     * sending it, so that the peer ends up with a hole exactly as if the message had been lost.
-     *
-     * <p><b>A testing aid, and the only thing here which exists for one.</b> It is deliberately
-     * not a doctored sequence number: the counters advance honestly, so the next real message
-     * follows on as it should, and what the peer misses is a message that genuinely exists. Delete
-     * this with the console's {@code /test} that calls it.
-     *
-     * @param chatId The id of the chat.
-     * @param text The message nobody will see until it is asked for.
-     * @param resendable Whether to keep it where a resend request can find it. False leaves the
-     * hole unanswerable, which is the case only {@link #standInFor(int)} can do anything about.
-     * @return A {@link Mono} completing when the counters and the message have been stored.
-     */
-    public Mono<Void> stageMessage(int chatId, String text, boolean resendable) {
-        Objects.requireNonNull(text);
-
-        return withChat(chatId, state -> {
-            var key = state.key();
-            if (state.status() != SecretChatState.Status.READY || key == null) {
-                return Mono.error(new SecretChatException(
-                        "Secret chat " + state.id() + " is not ready, it is " + state.status()));
-            }
-
-            var allocated = state.seqNo().allocate();
-            int layer = negotiatedLayer(state);
-            var payload = encrypt(state, key, BaseDecryptedMessage.builder()
-                    .randomId(random.nextLong())
-                    .ttl(state.ttl())
-                    .message(text)
-                    .build(), allocated.inSeqNo(), allocated.outSeqNo(), layer);
-
-            byte[] body;
-            try {
-                body = ByteBufUtil.getBytes(payload);
-            } finally {
-                // nothing is going to dispatch this one, so nothing else will release it
-                payload.release();
-            }
-
-            var next = state.toBuilder()
-                    .seqNo(allocated.next())
-                    .remainingMessages(Math.max(0, state.remainingMessages() - 1))
-                    .build();
-
-            log.info("Secret chat {} is keeping message {} back, {}", chatId, allocated.outSeqNo(),
-                    resendable ? "ready to send again when asked" : "with nothing kept to answer with");
-
-            return store.updateSecretChat(next)
-                    .then(resendable
-                            ? outbox.add(chatId, new SecretChatOutbox.Sent(allocated.outSeqNo(),
-                                    allocated.inSeqNo(), layer, false, body))
-                            : Mono.empty());
-        });
-    }
-
-    /**
      * Applies an {@code updateNewEncryptedMessage} to the chat it belongs to.
      *
      * <p> A message that fills a gap releases everything held behind it, so one update can emit

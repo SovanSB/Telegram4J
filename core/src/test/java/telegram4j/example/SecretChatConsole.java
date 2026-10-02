@@ -209,8 +209,6 @@ public final class SecretChatConsole {
                                      the only thing left when /resend cannot. Safe where a
                                      neighbour of the hole is still kept, MAY END THE CHAT
                                      otherwise. Without n, the number the peer last asked for
-              /test <chatId> [n] [unrecoverable]
-                                     TEMPORARY: make the peer miss n messages on purpose
               /help                  this
               /quit                  stop""";
 
@@ -584,14 +582,6 @@ public final class SecretChatConsole {
                         .doOnSuccess(ignored -> log("asked to replace the key of secret chat " + chatId
                                 + "; the answer arrives as an update"));
             }
-            case "/test" -> {
-                if (parts.length < 2) {
-                    yield Mono.fromRunnable(() -> log("usage: /test <chatId> [n] [unrecoverable]"));
-                }
-                int chatId = Integer.parseInt(parts[1]);
-                yield runTest(secretChats, chatId,
-                        parts.length < 3 ? new String[0] : parts[2].split("\\s+"));
-            }
             case "/discard" -> {
                 if (parts.length < 2) {
                     yield Mono.fromRunnable(() -> log("usage: /discard <chatId>"));
@@ -638,38 +628,6 @@ public final class SecretChatConsole {
             }
             default -> Mono.fromRunnable(() -> log("unknown command: " + parts[0] + ", try /help"));
         };
-    }
-
-    /**
-     * Makes the peer miss messages on purpose, to watch what it does about it.
-     *
-     * <p><b>TEMPORARY.</b> Delete this together with {@code /test} and
-     * {@link SecretChatManager#stageMessage(int, String, boolean)}.
-     *
-     * <p>Sends nothing for the first n numbers, then sends one message that the peer cannot put
-     * anywhere until it has the ones before it. What to watch for afterwards: whether the peer
-     * still reports reading our messages while it is stuck, whether it asks for the missing ones
-     * at all, and whether what we send back puts the conversation right on its screen.
-     *
-     * @param arguments How many messages to skip, 1 by default, and whether to keep them. Passing
-     * {@code unrecoverable} keeps nothing, so the peer's request cannot be answered and only
-     * {@code /standin} is left.
-     */
-    static Mono<Void> runTest(SecretChatManager secretChats, int chatId, String[] arguments) {
-        int missed = arguments.length > 0 ? Integer.parseInt(arguments[0]) : 1;
-        if (missed < 1) {
-            return Mono.fromRunnable(() -> log("the number of missed messages must be at least 1"));
-        }
-        boolean resendable = arguments.length < 2 || !arguments[1].equalsIgnoreCase("unrecoverable");
-
-        return Flux.range(1, missed)
-                .concatMap(i -> secretChats.stageMessage(chatId,
-                        "Pseudo missed " + i + "/" + missed, resendable))
-                .then(secretChats.sendMessage(chatId, "Test with missed " + missed))
-                .doOnSuccess(ignored -> log("kept back " + missed + " message(s) of secret chat "
-                        + chatId + (resendable ? ", which can be asked for" : " with nothing kept"
-                        + " to answer with") + ", then sent the one that should make the peer"
-                        + " notice the hole"));
     }
 
     static Mono<String> describePeer(MTProtoTelegramClient client, long peerId) {
