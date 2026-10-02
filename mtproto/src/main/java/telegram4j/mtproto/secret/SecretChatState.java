@@ -56,11 +56,6 @@ public final class SecretChatState {
         DISCARDED
     }
 
-    /** The layer to assume for a peer which has not told us its own yet. */
-    public static final int DEFAULT_LAYER = 46;
-    /** Messages a key may carry before it must be replaced, as in TDLib and MadelineProto. */
-    public static final int DEFAULT_MESSAGES_PER_KEY = 100;
-
     private final int id;
     private final long accessHash;
     private final long peerId;
@@ -184,7 +179,7 @@ public final class SecretChatState {
     /**
      * {@return The highest layer the peer has told us it supports}
      *
-     * <p> Starts at {@value #DEFAULT_LAYER} and only ever grows. Both an explicit
+     * <p> Starts at {@value SecretChatUtils#DEFAULT_LAYER} and only ever grows. Both an explicit
      * {@code decryptedMessageActionNotifyLayer} and the {@code layer} of any received
      * {@code decryptedMessageLayer} count as being told.
      */
@@ -228,8 +223,8 @@ public final class SecretChatState {
         private Instant keyCreatedAt;
         @Nullable
         private byte[] keyHash;
-        private int remainingMessages = DEFAULT_MESSAGES_PER_KEY;
-        private int layer = DEFAULT_LAYER;
+        private int remainingMessages = SecretChatUtils.DEFAULT_MESSAGES_PER_KEY;
+        private int layer = SecretChatUtils.DEFAULT_LAYER;
         private int ttl;
         private SeqNoState seqNo;
         private RekeyState rekey = RekeyState.idle();
@@ -283,7 +278,7 @@ public final class SecretChatState {
             this.oldKey = this.key;
             this.key = Objects.requireNonNull(key);
             this.keyCreatedAt = Objects.requireNonNull(createdAt);
-            this.remainingMessages = DEFAULT_MESSAGES_PER_KEY;
+            this.remainingMessages = SecretChatUtils.DEFAULT_MESSAGES_PER_KEY;
             this.secret = null;
             // only the key the chat started with decides what the two people compare
             if (this.keyHash == null) {

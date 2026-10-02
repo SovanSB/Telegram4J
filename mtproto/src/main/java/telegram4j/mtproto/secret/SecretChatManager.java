@@ -25,8 +25,13 @@ import telegram4j.mtproto.auth.DhParameters;
 import telegram4j.mtproto.auth.DhPrimeChecker;
 import telegram4j.mtproto.auth.DhPrimeCheckerCache;
 import telegram4j.mtproto.service.ChatService;
+import telegram4j.mtproto.store.FileStoreLayout;
+import telegram4j.mtproto.store.SecretChatOutbox;
+import telegram4j.mtproto.store.FileSecretChatOutbox;
+import telegram4j.mtproto.store.SecretChatOutboxImpl;
 import telegram4j.mtproto.store.SecretChatStore;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import telegram4j.tl.*;
 import telegram4j.tl.request.messages.ImmutableSendEncrypted;
@@ -42,6 +47,11 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 
+import static telegram4j.mtproto.secret.SecretChatUtils.LAYER;
+import static telegram4j.mtproto.secret.SecretChatUtils.MAX_REQUESTED_RESENDS;
+import static telegram4j.mtproto.secret.SecretChatUtils.RANDOM_BYTES;
+import static telegram4j.mtproto.secret.SecretChatUtils.negotiatedLayer;
+import static telegram4j.mtproto.secret.SecretChatUtils.stillReadable;
 import static telegram4j.mtproto.util.CryptoUtil.random;
 
 /**
@@ -58,16 +68,11 @@ public final class SecretChatManager {
 
     private static final Logger log = Loggers.getLogger(SecretChatManager.class);
 
-    /** The highest layer of the end-to-end schema this implementation can speak. */
-    public static final int LAYER = SecretTlInfo.LAYER;
-
-    /** Length of the padding inside {@code decryptedMessageLayer}, as TDLib writes it. */
-    private static final int RANDOM_BYTES = 31;
-
     private final ChatService service;
     private final SecretChatStore store;
     private final DhPrimeChecker primeChecker;
     private final boolean acceptLegacyMTProto;
+    private final SecretChatOutbox outbox;
 
     private volatile int dhVersion;
     @Nullable
@@ -87,12 +92,38 @@ public final class SecretChatManager {
     private final Map<Integer, NavigableMap<Integer, DecryptedMessageLayer>> pending =
         new ConcurrentHashMap<>();
 
+    /**
+     * How many messages one request may make us send again.
+     *
+     * <p> Wider than any outbox shipped here keeps, so it bounds what a peer asking for a great
+     * deal can make us send rather than getting in the way of an honest request. A peer left
+     * short asks again once it has processed what it got.
+     */
+    private static final int MAX_ANSWERED_RESENDS = 64;
+
     /** How many resend requests one chat may send in {@link #RESEND_WINDOW} before it is muted. */
     private static final int MAX_RESENDS = 3;
     private static final Duration RESEND_WINDOW = Duration.ofSeconds(30);
     private static final Duration RESEND_COOLDOWN = Duration.ofMinutes(5);
 
     private final Map<Integer, ResendLimit> resendLimits = new ConcurrentHashMap<>();
+    // the same bound the other way round: answering costs a message per hole, so a peer which
+    // keeps asking for what our answers do not satisfy would have us sending without end
+    private final Map<Integer, ResendLimit> answerLimits = new ConcurrentHashMap<>();
+
+    /**
+     * The lowest number a peer has asked for and we could not produce, per chat.
+     *
+     * <p> The only unambiguous statement of where a peer is stuck there is. Its own
+     * {@link SeqNoState#remoteInSeqNo()} cannot say: clients disagree by one about whether that
+     * number counts the messages processed or names the last of them, so deriving a position from
+     * it lands either on the hole or one message short of it, with no way to tell which. A resend
+     * request names the number itself.
+     *
+     * <p> Not persisted, and nothing is lost if it is: a peer still stuck asks again on the next
+     * message we send it.
+     */
+    private final Map<Integer, Integer> unanswered = new ConcurrentHashMap<>();
 
 
     public SecretChatManager(ChatService service, SecretChatStore store) {
@@ -106,10 +137,32 @@ public final class SecretChatManager {
      */
     public SecretChatManager(ChatService service, SecretChatStore store,
                              DhPrimeChecker primeChecker, boolean acceptLegacyMTProto) {
+        this(service, store, primeChecker, acceptLegacyMTProto, null);
+    }
+
+    /**
+     * @param outbox Where sent messages are kept so that they can be sent again when the peer
+     * asks, or {@code null} for a {@link FileSecretChatOutbox} over its default directory. A
+     * message the peer loses and this cannot produce is lost to the chat, which then stops
+     * showing anything we send after it, so the default is the one that survives a restart: a
+     * hole opened while we were not running is exactly the one worth being able to answer.
+     */
+    public SecretChatManager(ChatService service, SecretChatStore store,
+                             DhPrimeChecker primeChecker, boolean acceptLegacyMTProto,
+                             @Nullable SecretChatOutbox outbox) {
         this.service = Objects.requireNonNull(service);
         this.store = Objects.requireNonNull(store);
         this.primeChecker = Objects.requireNonNull(primeChecker);
         this.acceptLegacyMTProto = acceptLegacyMTProto;
+        if (outbox == null) {
+            if (store instanceof FileStoreLayout) {
+            // is not used by default for other types not to create unexpected files on disk
+                outbox = new FileSecretChatOutbox();
+            } else {
+                outbox = new SecretChatOutboxImpl();
+            }
+        }
+        this.outbox = outbox;
     }
 
     /**
@@ -181,7 +234,8 @@ public final class SecretChatManager {
                     log.debug("Failed to discard secret chat {}, forgetting it regardless", chatId, e);
                     return Mono.just(true);
                 })
-                .then(store.deleteSecretChat(chatId));
+                .then(store.deleteSecretChat(chatId))
+                .then(outbox.deleteAll(chatId));
     }
 
     /**
@@ -225,6 +279,63 @@ public final class SecretChatManager {
     }
 
     /**
+     * Allocates a sequence number and encrypts a message under it, then keeps it instead of
+     * sending it, so that the peer ends up with a hole exactly as if the message had been lost.
+     *
+     * <p><b>A testing aid, and the only thing here which exists for one.</b> It is deliberately
+     * not a doctored sequence number: the counters advance honestly, so the next real message
+     * follows on as it should, and what the peer misses is a message that genuinely exists. Delete
+     * this with the console's {@code /test} that calls it.
+     *
+     * @param chatId The id of the chat.
+     * @param text The message nobody will see until it is asked for.
+     * @param resendable Whether to keep it where a resend request can find it. False leaves the
+     * hole unanswerable, which is the case only {@link #standInFor(int)} can do anything about.
+     * @return A {@link Mono} completing when the counters and the message have been stored.
+     */
+    public Mono<Void> stageMessage(int chatId, String text, boolean resendable) {
+        Objects.requireNonNull(text);
+
+        return withChat(chatId, state -> {
+            var key = state.key();
+            if (state.status() != SecretChatState.Status.READY || key == null) {
+                return Mono.error(new SecretChatException(
+                        "Secret chat " + state.id() + " is not ready, it is " + state.status()));
+            }
+
+            var allocated = state.seqNo().allocate();
+            int layer = negotiatedLayer(state);
+            var payload = encrypt(state, key, BaseDecryptedMessage.builder()
+                    .randomId(random.nextLong())
+                    .ttl(state.ttl())
+                    .message(text)
+                    .build(), allocated.inSeqNo(), allocated.outSeqNo(), layer);
+
+            byte[] body;
+            try {
+                body = ByteBufUtil.getBytes(payload);
+            } finally {
+                // nothing is going to dispatch this one, so nothing else will release it
+                payload.release();
+            }
+
+            var next = state.toBuilder()
+                    .seqNo(allocated.next())
+                    .remainingMessages(Math.max(0, state.remainingMessages() - 1))
+                    .build();
+
+            log.info("Secret chat {} is keeping message {} back, {}", chatId, allocated.outSeqNo(),
+                    resendable ? "ready to send again when asked" : "with nothing kept to answer with");
+
+            return store.updateSecretChat(next)
+                    .then(resendable
+                            ? outbox.add(chatId, new SecretChatOutbox.Sent(allocated.outSeqNo(),
+                                    allocated.inSeqNo(), layer, false, body))
+                            : Mono.empty());
+        });
+    }
+
+    /**
      * Applies an {@code updateNewEncryptedMessage} to the chat it belongs to.
      *
      * <p> A message that fills a gap releases everything held behind it, so one update can emit
@@ -254,10 +365,16 @@ public final class SecretChatManager {
      * Gives up on the messages a chat is waiting for and carries on with what came after them.
      *
      * <p> A gap normally clears itself: the missing messages arrive, or the peer resends them
-     * when asked. Neither happens when the peer is TDLib, which asks for resends but answers
-     * none, so a message lost on the way leaves the chat stuck for good. This is the way out,
-     * and it is deliberately manual because it throws those messages away: their contents are
-     * gone, and if one of them changed the layer or the key, that change is lost with it.
+     * when asked. Neither happens once the peer no longer has them, and then the chat is stuck
+     * for good. This is the way out, and it is deliberately manual because it throws those
+     * messages away: their contents are gone, and if one of them changed the layer or the key,
+     * that change is lost with it.
+     *
+     * <p> It also gives them up on the peer's behalf. Stepping over a message means the next one
+     * we send reports having processed it, and a peer that keeps sent messages until they are
+     * acknowledged, as TDLib does, drops it at that point. Asking for it afterwards would be
+     * asking for something nobody has, which TDLib treats as fatal; the counters see to it that
+     * we never do, since they never go back over what they have stepped over.
      *
      * @param chatId The id of the chat.
      * @return A {@link Flux} emitting the messages that were held behind the gap.
@@ -288,11 +405,15 @@ public final class SecretChatManager {
     /**
      * Asks the peer to send again what we are missing, unless this chat has been asking too often.
      *
-     * <p> The bounds are in the peer's own numbering, since it is the one being asked. Peers
-     * differ in whether they honour this: MadelineProto replays what it stored, and the official
-     * Android client answers too, replaying messages lost more than an hour earlier. TDLib is
-     * the exception and ignores the request outright, its handler being a bare {@code return
-     * Status::OK()}, so an answer is worth asking for but never worth waiting for.
+     * <p> The bounds are in the peer's own numbering, since it is the one being asked, and both
+     * MadelineProto and TDLib honour them by replaying what they stored.
+     *
+     * <p> Asking is not free of consequence. TDLib answers from the messages it has yet to see
+     * acknowledged, and a request naming one it no longer has, or spanning more than
+     * {@value telegram4j.mtproto.secret.SecretChatUtils#MAX_REQUESTED_RESENDS}, ends in an
+     * error it treats as fatal and answers by
+     * discarding the chat. The range is therefore capped here, and it only ever names messages
+     * we have not acknowledged, which are exactly the ones a peer still keeps.
      *
      * <p> Repeats of a range already asked for are skipped: every message stuck behind a gap
      * would otherwise send one, and the ranges nest, so a peer that is already replaying gets
@@ -313,11 +434,17 @@ public final class SecretChatManager {
             return Mono.empty();
         }
 
-        limit.asked(fromSeqNo, toSeqNo);
+        // TDLib's own bound on what it will answer, and asking for more is fatal to it
+        int last = Math.min(toSeqNo, fromSeqNo + MAX_REQUESTED_RESENDS - 1);
+        if (last < toSeqNo) {
+            log.warn("Secret chat {} is missing {}..{}, asking only for {}..{}",
+                    state.id(), fromSeqNo, toSeqNo, fromSeqNo, last);
+        }
+        limit.asked(fromSeqNo, last);
 
         var seqNo = state.seqNo();
         return sendService(state, ImmutableDecryptedMessageActionResend.of(
-                        seqNo.toRemoteWireSeqNo(fromSeqNo), seqNo.toRemoteWireSeqNo(toSeqNo)))
+                        seqNo.toRemoteWireSeqNo(fromSeqNo), seqNo.toRemoteWireSeqNo(last)))
                 .onErrorResume(e -> {
                     log.warn("Failed to ask secret chat {} for a resend", state.id(), e);
                     return Mono.empty();
@@ -325,7 +452,256 @@ public final class SecretChatManager {
                 .then();
     }
 
-    /** Delivers whatever the newly filled gap has unblocked, in order. */
+    /**
+     * Sends the peer again what it says it never got.
+     *
+     * <p> The bounds are in our own numbering, since we are the side being asked, and step by two
+     * like every sequence number of one direction. Messages still in the {@linkplain
+     * SecretChatOutbox outbox} go out again exactly as they went out the first time; what
+     * {@link #answerResend} does about the rest is the interesting half.
+     */
+    private Mono<SecretChatState> onResend(SecretChatState state, DecryptedMessageActionResend resend) {
+        var limit = answerLimits.computeIfAbsent(state.id(), id -> new ResendLimit());
+        if (!limit.allow(Instant.now())) {
+            log.warn("Secret chat {} is asking for resends too often, not answering for {}",
+                    state.id(), RESEND_COOLDOWN);
+            return store.updateSecretChat(state).thenReturn(state);
+        }
+
+        log.info("Secret chat {} asks us to resend {}..{}", state.id(),
+                resend.startSeqNo(), resend.endSeqNo());
+        return answerResend(state, resend.startSeqNo(), resend.endSeqNo())
+                .then(store.updateSecretChat(state))
+                .thenReturn(state);
+    }
+
+    /**
+     * Sends the peer again everything it has not reported processing.
+     *
+     * <p> The mirror image of {@link #skipGap(int)}: there the messages we are missing are given
+     * up on, here the ones the peer is missing are offered again. A peer stuck behind a hole says
+     * nothing about it beyond the {@code in_seq_no} it keeps quoting, which is why this is manual.
+     * It is worth reaching for when a chat still delivers the peer's messages while ours stop
+     * being answered and {@link SeqNoState#remoteInSeqNo()} stands well behind
+     * {@link SeqNoState#outSeqNo()}.
+     *
+     * <p> It can only offer what the {@linkplain SecretChatOutbox outbox} still holds. A hole
+     * older than that cannot be closed from this side at all, and the chat stays stuck in the
+     * outgoing direction for good; there is no message that stands in for one whose sequence
+     * number is known and whose contents are not.
+     *
+     * @param chatId The id of the chat.
+     * @return A {@link Mono} completing when everything still held has been sent again.
+     */
+    public Mono<Void> resendUnconfirmed(int chatId) {
+        return withChat(chatId, state -> {
+            var seqNo = state.seqNo();
+            if (seqNo.remoteInSeqNo() >= seqNo.outSeqNo()) {
+                log.debug("Secret chat {} has nothing the peer has not confirmed", chatId);
+                return Mono.empty();
+            }
+
+            log.info("Sending secret chat {} messages {}..{} again, which it never confirmed",
+                    chatId, seqNo.remoteInSeqNo(), seqNo.outSeqNo() - 1);
+            return answerResend(state, seqNo.toWireSeqNo(seqNo.remoteInSeqNo()),
+                    seqNo.toWireSeqNo(seqNo.outSeqNo() - 1));
+        });
+    }
+
+    /**
+     * Sends again the messages in a range of our own wire sequence numbers.
+     *
+     * <p> The range is taken as a request rather than an instruction: a bound of the wrong parity
+     * names messages of the other direction and is refused outright, one beyond what we have sent
+     * is trimmed to what exists, and an overlong range is cut to its start, which is the end that
+     * matters since the peer is stopped at the oldest hole and everything after it is being held
+     * rather than lost.
+     *
+     * <p> A message the outbox no longer has is passed over, unless the outbox offers something to
+     * put in its place; see {@link #standIn}.
+     */
+    private Mono<Void> answerResend(SecretChatState state, int fromSeqNo, int toSeqNo) {
+        var seqNo = state.seqNo();
+        if (!seqNo.isOurWireSeqNo(fromSeqNo) || !seqNo.isOurWireSeqNo(toSeqNo) || fromSeqNo > toSeqNo) {
+            log.warn("Secret chat {} asked for {}..{}, which is not a range of our messages",
+                    state.id(), fromSeqNo, toSeqNo);
+            return Mono.empty();
+        }
+        if (seqNo.outSeqNo() == 0 || fromSeqNo > seqNo.toWireSeqNo(seqNo.outSeqNo() - 1)) {
+            log.warn("Secret chat {} asked for {}..{}, beyond the {} messages we have sent",
+                    state.id(), fromSeqNo, toSeqNo, seqNo.outSeqNo());
+            return Mono.empty();
+        }
+
+        int last = Math.min(toSeqNo, seqNo.toWireSeqNo(seqNo.outSeqNo() - 1));
+        last = Math.min(last, fromSeqNo + 2 * (MAX_ANSWERED_RESENDS - 1));
+        if (last < toSeqNo) {
+            log.warn("Secret chat {} asked for {}..{}, answering only up to {}",
+                    state.id(), fromSeqNo, toSeqNo, last);
+        }
+
+        int count = (last - fromSeqNo) / 2 + 1;
+        int first = fromSeqNo;
+        // one after another: they are being sent because their order is what the peer is stuck on
+        return Flux.range(0, count)
+                .concatMap(i -> resend(state, first + 2 * i))
+                .then();
+    }
+
+    /** Sends one message again, if the outbox still has it and the peer could still read it. */
+    private Mono<Void> resend(SecretChatState state, int outSeqNo) {
+        return outbox.get(state.id(), outSeqNo)
+                .filter(sent -> stillReadable(state, sent))
+                .flatMap(sent -> dispatch(state, Unpooled.wrappedBuffer(sent.payload()), sent.service())
+                        .thenReturn(true))
+                .defaultIfEmpty(false)
+                .doOnNext(resent -> {
+                    if (!resent) {
+                        // the peer has just said where it is stuck, which is worth keeping: it is
+                        // the number standInFor would otherwise have to guess at
+                        unanswered.merge(state.id(), outSeqNo, Math::min);
+                        // said plainly, because it is the end of the chat in that direction unless
+                        // somebody decides to gamble on standInFor
+                        log.warn("Secret chat {} can no longer send message {} again, and the peer"
+                                + " will show nothing after it", state.id(), outSeqNo);
+                    }
+                })
+                .then();
+    }
+
+    /**
+     * Sends something which merely occupies the number of a message we can no longer produce, in
+     * the hope that the peer moves past it.
+     *
+     * <p><b>This may end the chat, and often will.</b> A stand-in has to carry an
+     * {@code in_seq_no} and a layer; the peer records them and then replays the messages it was
+     * holding behind the hole through the same check, where anything carrying lower values fails
+     * as not monotonic, which TDLib answers by discarding the chat. The only certainly safe values
+     * are those of the message right after the lost one, and if we still had that one the outbox
+     * would have answered the peer already. What is used instead is the oldest message still kept,
+     * which is the lowest value that is certainly high enough for the peer to accept, and the
+     * chat survives only if the peer is holding nothing between the hole and it.
+     *
+     * <p> It is offered because the alternative is not a working chat: a peer stuck behind a hole
+     * shows nothing we send ever again, so the choice is between a chat that is already dead in
+     * that direction and a chance of reviving it at the risk of losing it outright. Nothing else
+     * mends it, and {@link #discardSecretChat(int, boolean)} is the tidy way to give up instead.
+     *
+     * @param chatId The id of the chat.
+     * @param outSeqNo The wire {@code out_seq_no} to stand in for. The one the peer is waiting on
+     * is {@link SeqNoState#remoteInSeqNo()} put through {@link SeqNoState#toWireSeqNo(int)}, which
+     * is what {@link #standInFor(int)} uses.
+     * @return A {@link Mono} completing when the stand-in has been sent.
+     */
+    public Mono<Void> standInFor(int chatId, int outSeqNo) {
+        return withChat(chatId, state -> standIn(state, outSeqNo));
+    }
+
+    /**
+     * Stands in for the message the peer last asked for and could not be given.
+     *
+     * <p> A peer names that number itself, in a resend request we failed to answer, and this uses
+     * the one it named. Failing that it falls back to what the peer reports having processed,
+     * which is a guess by up to one message; see {@link #unanswered} for why it cannot be better
+     * than that.
+     *
+     * @param chatId The id of the chat.
+     * @return A {@link Mono} completing when the stand-in has been sent.
+     * @see #standInFor(int, int)
+     */
+    public Mono<Void> standInFor(int chatId) {
+        return withChat(chatId, state -> {
+            var asked = unanswered.get(chatId);
+            if (asked != null) {
+                return standIn(state, asked);
+            }
+
+            var seqNo = state.seqNo();
+            if (seqNo.remoteInSeqNo() >= seqNo.outSeqNo()) {
+                log.info("Secret chat {} is not waiting on anything of ours", chatId);
+                return Mono.empty();
+            }
+
+            // nothing has been asked for since this process started, so the peer's own report is
+            // all there is. It is the conservative end of the guess: a client which names the last
+            // message it processed rather than counting them puts this one message before the
+            // hole, where a stand-in is merely ignored. Better to be told the number
+            int guess = seqNo.toWireSeqNo(seqNo.remoteInSeqNo());
+            log.warn("Nothing has been asked for in secret chat {} since startup, so message {} is"
+                    + " a guess from what the peer last reported. If a resend request named a"
+                    + " number, pass that one instead", chatId, guess);
+            return standIn(state, guess);
+        });
+    }
+
+    private Mono<Void> standIn(SecretChatState state, int outSeqNo) {
+        var key = state.key();
+        if (key == null || state.status() != SecretChatState.Status.READY) {
+            return Mono.error(new SecretChatException(
+                    "Secret chat " + state.id() + " is not ready, it is " + state.status()));
+        }
+        if (!state.seqNo().isOurWireSeqNo(outSeqNo)) {
+            return Mono.error(new SecretChatException(
+                    outSeqNo + " is not the number of a message of ours in secret chat " + state.id()));
+        }
+
+        return outbox.get(state.id(), outSeqNo)
+                .flatMap(sent -> {
+                    log.warn("Secret chat {} still has message {}; sending it again beats standing"
+                            + " in for it", state.id(), outSeqNo);
+                    return dispatch(state, Unpooled.wrappedBuffer(sent.payload()), sent.service())
+                            .thenReturn(true);
+                })
+                .switchIfEmpty(neighbourOf(state.id(), outSeqNo)
+                        .flatMap(neighbour -> {
+                            log.info("Standing in for message {} of secret chat {} with the numbers"
+                                    + " of its neighbour {}, which the peer accepts and leaves"
+                                    + " everything it holds acceptable",
+                                    outSeqNo, state.id(), neighbour.outSeqNo());
+                            return sendStandIn(state, key, outSeqNo, neighbour.inSeqNo(),
+                                    neighbour.layer()).thenReturn(true);
+                        }))
+                .switchIfEmpty(Mono.defer(() -> {
+                    log.warn("Standing in for message {} of secret chat {} with the chat's current"
+                            + " numbers, nothing being kept to guess better. This is the worst"
+                            + " guess there is and will most likely end the chat",
+                            outSeqNo, state.id());
+                    return sendStandIn(state, key, outSeqNo, state.seqNo().inWireSeqNo(),
+                            negotiatedLayer(state)).thenReturn(true);
+                }))
+                // whatever came of it, this number has had its turn
+                .doOnNext(ignored -> unanswered.remove(state.id(), outSeqNo))
+                .then();
+    }
+
+    /**
+     * {@return A message next to the given number whose numbers a stand-in may safely carry}
+     *
+     * <p> Only the two immediate neighbours will do, and the one before is the better of them.
+     * The peer recorded that message's {@code in_seq_no} and layer as it processed it, so
+     * repeating them is accepted as equal rather than merely allowed, and everything the peer
+     * holds behind the hole was sent later and carries no less. The one after works for the same
+     * reason from the other side.
+     *
+     * <p> Anything further away is not safe, however tempting. A message several places along
+     * says nothing about what sits between it and the hole, and the peer is holding exactly that,
+     * about to replay it through a check the stand-in would have just raised the bar on.
+     */
+    private Mono<SecretChatOutbox.Sent> neighbourOf(int chatId, int outSeqNo) {
+        // one direction's numbers step by two, so the neighbours are two away in each direction
+        return outbox.get(chatId, outSeqNo - 2)
+                .switchIfEmpty(Mono.defer(() -> outbox.get(chatId, outSeqNo + 2)));
+    }
+
+    private Mono<Void> sendStandIn(SecretChatState state, AuthKey key, int outSeqNo,
+                                   int inSeqNo, int layer) {
+        var noop = DecryptedMessageService.builder()
+                .randomId(random.nextLong())
+                .action(DecryptedMessageActionNoop.instance())
+                .build();
+        return dispatch(state, encrypt(state, key, noop, inSeqNo, outSeqNo, layer), true);
+    }
+
     /**
      * Hands on the message the counters are now waiting for, if it arrived early and was held.
      *
@@ -449,11 +825,11 @@ public final class SecretChatManager {
         }
 
         var action = serviceMessage.action();
-        // a key replacement answers the peer, so it takes over the state this message produced
-        // rather than being folded into the builder
-        var rekeyed = rekeyAction(builder.build(), action);
-        if (rekeyed != null) {
-            return rekeyed.flatMapMany(this::releaseHeldMessages);
+        // some actions are answered rather than applied, so they take over the state this message
+        // produced instead of being folded into the builder
+        var answered = answeredAction(builder.build(), action);
+        if (answered != null) {
+            return answered.flatMapMany(this::releaseHeldMessages);
         }
 
         applyAction(builder, state, action);
@@ -475,15 +851,26 @@ public final class SecretChatManager {
             }
             case DecryptedMessageActionSetMessageTTL.ID ->
                     builder.ttl(((DecryptedMessageActionSetMessageTTL) action).ttlSeconds());
-            default -> log.debug("Unhandled service action in secret chat {}: {}", state.id(), action);
+            // doing nothing is what it is for, and it is not a curiosity: a side which has taken a
+            // replacement key into use has to send something under it to show the switch took
+            // effect, and sends this when it has nothing of its own to say. Arriving after a
+            // commitKey, it is the sign that the replacement completed. We send one ourselves in
+            // the same place, see #onCommitKey
+            case DecryptedMessageActionNoop.ID ->
+                    log.debug("Secret chat {} sent a no-op", state.id());
+            // said out loud rather than dropped at debug: an action nothing here understands is
+            // how a chat comes to be waiting for something we are never going to do
+            default -> log.info("Unhandled service action in secret chat {}: {}", state.id(), action);
         }
     }
 
-    // the actions of a key replacement, which answer the peer and so cannot be applied to the
-    // builder alone; each returns the state it leaves behind, already persisted
+    // the actions which answer the peer and so cannot be applied to the builder alone; each
+    // returns the state it leaves behind, already persisted
     @Nullable
-    private Mono<SecretChatState> rekeyAction(SecretChatState state, DecryptedMessageAction action) {
+    private Mono<SecretChatState> answeredAction(SecretChatState state, DecryptedMessageAction action) {
         return switch (action.identifier()) {
+            case DecryptedMessageActionResend.ID ->
+                    onResend(state, (DecryptedMessageActionResend) action);
             case DecryptedMessageActionRequestKey.ID ->
                     onRequestKey(state, (DecryptedMessageActionRequestKey) action);
             case DecryptedMessageActionAcceptKey.ID ->
@@ -499,8 +886,6 @@ public final class SecretChatManager {
         };
     }
 
-    /** How long a key may stay in use however few messages it carries. */
-    private static final Duration MAX_KEY_AGE = Duration.ofDays(7);
     /** How long to wait before starting another unprompted key replacement in the same chat. */
     private static final Duration REKEY_RETRY_INTERVAL = Duration.ofMinutes(5);
 
@@ -519,7 +904,7 @@ public final class SecretChatManager {
 
         var createdAt = state.keyCreatedAt();
         boolean worn = state.remainingMessages() <= 0
-                || createdAt != null && createdAt.plus(MAX_KEY_AGE).isBefore(Instant.now());
+                || createdAt != null && createdAt.plus(SecretChatUtils.MAX_KEY_AGE).isBefore(Instant.now());
         if (!worn) {
             return Mono.empty();
         }
@@ -713,38 +1098,70 @@ public final class SecretChatManager {
                     "Secret chat " + state.id() + " is not ready, it is " + state.status()));
         }
 
-        byte[] randomBytes = new byte[RANDOM_BYTES];
-        random.nextBytes(randomBytes);
-
         var allocated = state.seqNo().allocate();
-        var layer = DecryptedMessageLayer.builder()
-                .randomBytes(Unpooled.wrappedBuffer(randomBytes))
-                .layer(negotiatedLayer(state))
-                .inSeqNo(allocated.inSeqNo())
-                .outSeqNo(allocated.outSeqNo())
-                .message(message)
-                .build();
-
-        ByteBuf payload = new SecretChatCipher(acceptLegacyMTProto)
-                .encrypt(key, state.creator(), layer);
-        long randomId = random.nextLong();
-        var peer = ImmutableInputEncryptedChat.of(state.id(), state.accessHash());
+        int layer = negotiatedLayer(state);
+        ByteBuf payload = encrypt(state, key, message, allocated.inSeqNo(), allocated.outSeqNo(), layer);
 
         var next = state.toBuilder()
                 .seqNo(allocated.next())
                 .remainingMessages(Math.max(0, state.remainingMessages() - 1))
                 .build();
 
+        var sent = new SecretChatOutbox.Sent(allocated.outSeqNo(), allocated.inSeqNo(), layer,
+                serviceMessage, ByteBufUtil.getBytes(payload));
+
         // the counter reaches the disk before the message that carries it reaches the peer.
         // The other order loses the chat: after a crash we would hand out a sequence number the
         // peer has already seen, and it discards the chat rather than guess what we meant
         return store.updateSecretChat(next)
-                // the request is built on subscription, so the payload has to outlive this method
-                .then(Mono.defer(() -> serviceMessage
-                        ? service.sendEncryptedService(peer, randomId, payload)
-                        : service.sendEncrypted(ImmutableSendEncrypted.of(0, peer, randomId, payload))))
-                .doFinally(signal -> payload.release())
+                // the outbox is not held to that: it is a cache, and one that failed to record a
+                // message costs an answer to a resend request rather than the chat
+                .then(outbox.add(state.id(), sent)
+                        .onErrorResume(e -> {
+                            log.warn("Failed to record message {} of secret chat {} for resending",
+                                    allocated.outSeqNo(), state.id(), e);
+                            return Mono.empty();
+                        }))
+                .then(dispatch(state, payload, serviceMessage))
                 .thenReturn(next);
+    }
+
+    /** Wraps a message in a {@code decryptedMessageLayer} carrying the given numbers, encrypted. */
+    private ByteBuf encrypt(SecretChatState state, AuthKey key, DecryptedMessage message,
+                            int inSeqNo, int outSeqNo, int announcedLayer) {
+        byte[] randomBytes = new byte[RANDOM_BYTES];
+        random.nextBytes(randomBytes);
+
+        var layer = DecryptedMessageLayer.builder()
+                .randomBytes(Unpooled.wrappedBuffer(randomBytes))
+                .layer(announcedLayer)
+                .inSeqNo(inSeqNo)
+                .outSeqNo(outSeqNo)
+                .message(message)
+                .build();
+
+        return new SecretChatCipher(acceptLegacyMTProto).encrypt(key, state.creator(), layer);
+    }
+
+    /**
+     * Hands an encrypted body to the server and releases it, whatever the outcome.
+     *
+     * <p> The {@code random_id} is drawn here rather than kept with the message, so that replaying
+     * one from the {@linkplain SecretChatOutbox outbox} looks to the server like a new request
+     * instead of a repeat it may answer from what it already stored. What keeps the peer from
+     * showing the message twice is the {@code random_id} inside the encrypted body, which stays
+     * what it was.
+     */
+    private Mono<Void> dispatch(SecretChatState state, ByteBuf payload, boolean serviceMessage) {
+        long randomId = random.nextLong();
+        var peer = ImmutableInputEncryptedChat.of(state.id(), state.accessHash());
+
+        // the request is built on subscription, so the payload has to outlive this method
+        return Mono.defer(() -> serviceMessage
+                        ? service.sendEncryptedService(peer, randomId, payload)
+                        : service.sendEncrypted(ImmutableSendEncrypted.of(0, peer, randomId, payload)))
+                .doFinally(signal -> payload.release())
+                .then();
     }
 
     private Mono<Void> withChat(int chatId, java.util.function.Function<SecretChatState, Mono<?>> action) {
@@ -752,11 +1169,6 @@ public final class SecretChatManager {
                 .switchIfEmpty(Mono.error(() -> new SecretChatException("No secret chat with id " + chatId)))
                 .flatMap(action)
                 .then();
-    }
-
-    // neither side gains from claiming a layer the other cannot read
-    private static int negotiatedLayer(SecretChatState state) {
-        return Math.min(LAYER, Math.max(state.layer(), SecretChatState.DEFAULT_LAYER));
     }
 
     // the peer asked us to open a chat: derive the key from its half and answer with ours
@@ -819,8 +1231,11 @@ public final class SecretChatManager {
                     var gone = state.toBuilder().status(SecretChatState.Status.DISCARDED).build();
                     log.debug("Secret chat {} discarded by the peer", discarded.id());
                     // the state is kept rather than deleted so that late messages are dropped
-                    // instead of being taken for the start of a new chat
-                    return store.updateSecretChat(gone).thenReturn(gone);
+                    // instead of being taken for the start of a new chat. What it sent is not
+                    // kept: nothing will ever ask for it again
+                    return store.updateSecretChat(gone)
+                            .then(outbox.deleteAll(discarded.id()))
+                            .thenReturn(gone);
                 });
     }
 

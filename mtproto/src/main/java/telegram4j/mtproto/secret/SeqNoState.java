@@ -111,7 +111,21 @@ public final class SeqNoState {
         return outSeqNo;
     }
 
-    /** {@return How many of our messages the peer has reported processing} */
+    /**
+     * {@return How many of our messages the peer has reported processing}
+     *
+     * <p> A floor rather than a measurement, and it lags for two reasons at once. It can only
+     * change when the peer speaks, so everything sent since its last message is missing from it;
+     * and clients disagree about what the number counts. TDLib and this implementation put in the
+     * count of messages processed, while the official Android client puts in the index of the
+     * last one, which is one less. Both pass the only check anyone makes of it, so the
+     * disagreement goes unnoticed and is not ours to correct.
+     *
+     * <p><b>Do not try to normalise it.</b> Adding one for the clients that appear to be behind
+     * is how an implementation ends up with an off-by-one that follows the peer's platform
+     * around. Nothing here is derived from this value; it bounds what the peer may claim, and a
+     * peer claiming less than the truth never troubles that bound.
+     */
     public int remoteInSeqNo() {
         return remoteInSeqNo;
     }
@@ -127,7 +141,7 @@ public final class SeqNoState {
      * follow sending it.
      */
     public Allocated allocate() {
-        return new Allocated(2 * inSeqNo + inBase, 2 * outSeqNo + outBase,
+        return new Allocated(inWireSeqNo(), toWireSeqNo(outSeqNo),
                 new SeqNoState(creator, inSeqNo, outSeqNo + 1, remoteInSeqNo));
     }
 
@@ -190,6 +204,32 @@ public final class SeqNoState {
      */
     public int toRemoteWireSeqNo(int seqNo) {
         return 2 * seqNo + inBase;
+    }
+
+    /**
+     * Converts a raw sequence number to the wire value this side put on that message.
+     *
+     * <p> The inverse of what {@link #accept(int, int)} does to the peer's numbers, and what a
+     * resend request quotes back at us: its bounds are in the numbering of the side being asked.
+     */
+    public int toWireSeqNo(int seqNo) {
+        return 2 * seqNo + outBase;
+    }
+
+    /** {@return The wire {@code in_seq_no} the next outgoing message carries} */
+    public int inWireSeqNo() {
+        return 2 * inSeqNo + inBase;
+    }
+
+    /**
+     * {@return Whether the given wire value could name a message of ours}
+     *
+     * <p> Only the parity is checked, which is what tells the two directions apart; whether we
+     * have sent that many messages is a separate question, and one the caller answers with
+     * {@link #toWireSeqNo(int)} against {@link #outSeqNo()}.
+     */
+    public boolean isOurWireSeqNo(int wireSeqNo) {
+        return wireSeqNo >= 0 && wireSeqNo % 2 == outBase;
     }
 
     @Override

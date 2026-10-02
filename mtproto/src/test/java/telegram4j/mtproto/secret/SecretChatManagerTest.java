@@ -21,11 +21,14 @@ import io.netty.buffer.Unpooled;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Mono;
 import telegram4j.mtproto.DcId;
+import telegram4j.mtproto.auth.DhPrimeCheckerCache;
 import telegram4j.mtproto.auth.TestDhParameters;
 import telegram4j.mtproto.client.MTProtoClient;
 import telegram4j.mtproto.client.MTProtoClientGroup;
 import telegram4j.mtproto.client.UpdateDispatcher;
 import telegram4j.mtproto.service.ChatService;
+import telegram4j.mtproto.store.SecretChatOutbox;
+import telegram4j.mtproto.store.SecretChatOutboxImpl;
 import telegram4j.mtproto.store.StoreLayoutImpl;
 import telegram4j.tl.*;
 import telegram4j.tl.api.TlMethod;
@@ -38,6 +41,10 @@ import telegram4j.tl.request.messages.RequestEncryption;
 import telegram4j.tl.request.messages.SendEncrypted;
 import telegram4j.tl.request.messages.SendEncryptedService;
 import telegram4j.tl.secret.BaseDecryptedMessage;
+import telegram4j.tl.secret.DecryptedMessageAction;
+import telegram4j.tl.secret.DecryptedMessageLayer;
+import telegram4j.tl.secret.DecryptedMessageService;
+import telegram4j.tl.secret.ImmutableDecryptedMessageActionResend;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -132,10 +139,23 @@ class SecretChatManagerTest {
         final FakeServer participantServer = new FakeServer(world);
         final StoreLayoutImpl initiatorStore = new StoreLayoutImpl(c -> c);
         final StoreLayoutImpl participantStore = new StoreLayoutImpl(c -> c);
-        final SecretChatManager initiator =
-                new SecretChatManager(new ChatService(initiatorServer, initiatorStore), initiatorStore);
-        final SecretChatManager participant =
-                new SecretChatManager(new ChatService(participantServer, participantStore), participantStore);
+        final SecretChatManager initiator;
+        final SecretChatManager participant;
+        final SecretChatOutbox initiatorOutbox;
+        final SecretChatOutbox participantOutbox;
+
+        Chat() {
+            this(SecretChatOutboxImpl.DEFAULT_CAPACITY);
+        }
+
+        Chat(int outboxCapacity) {
+            initiatorOutbox = new SecretChatOutboxImpl(outboxCapacity);
+            participantOutbox = new SecretChatOutboxImpl(outboxCapacity);
+            initiator = new SecretChatManager(new ChatService(initiatorServer, initiatorStore),
+                    initiatorStore, DhPrimeCheckerCache.instance(), false, initiatorOutbox);
+            participant = new SecretChatManager(new ChatService(participantServer, participantStore),
+                    participantStore, DhPrimeCheckerCache.instance(), false, participantOutbox);
+        }
 
         /** Runs the exchange that gives both sides a key, including the layer each announces. */
         Chat establish() {
@@ -181,6 +201,40 @@ class SecretChatManagerTest {
             var state = participantStore.getSecretChat(CHAT_ID).block();
             assertNotNull(state);
             return state;
+        }
+
+        /**
+         * Sends a service action from the participant, which has no API of its own for one.
+         *
+         * <p> The point is the actions no correct client would send: a manager can only be made to
+         * produce well-formed ones, and what happens to the rest is exactly what wants testing.
+         */
+        EncryptedMessage participantSends(DecryptedMessageAction action) {
+            var state = participantState();
+            var allocated = state.seqNo().allocate();
+            var layer = DecryptedMessageLayer.builder()
+                    .randomBytes(Unpooled.wrappedBuffer(new byte[31]))
+                    .layer(SecretChatUtils.LAYER)
+                    .inSeqNo(allocated.inSeqNo())
+                    .outSeqNo(allocated.outSeqNo())
+                    .message(DecryptedMessageService.builder().randomId(1).action(action).build())
+                    .build();
+
+            participantStore.updateSecretChat(state.toBuilder().seqNo(allocated.next()).build()).block();
+            var key = state.key();
+            assertNotNull(key);
+
+            // the cipher hands back a buffer from the allocator, and an incoming message is not
+            // the manager's to release: in a real chat it belongs to whoever deserialized the
+            // update. Copying it out and letting the original go keeps this from being reported
+            // as a leak, which would bury a real one
+            var payload = new SecretChatCipher(false).encrypt(key, state.creator(), layer);
+            try {
+                return ImmutableEncryptedMessageService.of(1, CHAT_ID, 0,
+                        Unpooled.wrappedBuffer(ByteBufUtil.getBytes(payload)));
+            } finally {
+                payload.release();
+            }
         }
     }
 
@@ -230,8 +284,8 @@ class SecretChatManagerTest {
         chat.initiator.onUpdate(chat.accepted()).block();
         chat.settle();
 
-        assertEquals(SecretChatManager.LAYER, chat.initiatorState().layer());
-        assertEquals(SecretChatManager.LAYER, chat.participantState().layer());
+        assertEquals(SecretChatUtils.LAYER, chat.initiatorState().layer());
+        assertEquals(SecretChatUtils.LAYER, chat.participantState().layer());
     }
 
     @Test
@@ -437,6 +491,335 @@ class SecretChatManagerTest {
     }
 
     @Test
+    void aMessageThePeerNeverGotIsSentAgainWhenItAsks() {
+        var chat = new Chat().establish();
+
+        chat.initiator.sendMessage(CHAT_ID, "lost").block();
+        chat.initiator.sendMessage(CHAT_ID, "arrived").block();
+        var arrived = chat.initiatorServer.outbox.get(1);
+
+        // only the second arrives, so the participant holds it and asks for the first
+        chat.participantServer.outbox.clear();
+        assertNull(chat.participant.onNewMessage(arrived).blockFirst());
+        assertEquals(1, chat.participantServer.outbox.size(), "no resend was requested");
+
+        // the initiator answers out of its outbox rather than ignoring the request
+        chat.initiatorServer.outbox.clear();
+        chat.initiator.onNewMessage(chat.participantServer.outbox.get(0)).blockLast();
+        assertEquals(1, chat.initiatorServer.outbox.size(), "the request went unanswered");
+
+        // and what comes back is the message itself, which releases what was held behind it
+        var delivered = chat.participant.onNewMessage(chat.initiatorServer.outbox.get(0))
+                .cast(BaseDecryptedMessage.class)
+                .map(BaseDecryptedMessage::message)
+                .collectList()
+                .block();
+        assertEquals(List.of("lost", "arrived"), delivered);
+    }
+
+    @Test
+    void aResentMessageIsTheOneThatWasSent() {
+        var chat = new Chat().establish();
+        chat.initiator.sendMessage(CHAT_ID, "only").block();
+
+        var original = chat.initiatorServer.outbox.get(0);
+        // the last one sent, since keying the chat spent a sequence number on the layer notice
+        var seqNo = chat.initiatorState().seqNo();
+        int outSeqNo = seqNo.toWireSeqNo(seqNo.outSeqNo() - 1);
+
+        chat.initiatorServer.outbox.clear();
+        chat.initiator.onNewMessage(chat.participantSends(
+                ImmutableDecryptedMessageActionResend.of(outSeqNo, outSeqNo))).blockLast();
+
+        // byte for byte: a resend has to carry the sequence numbers of the message it replaces,
+        // and re-encrypting would produce a message the peer counts as the next one instead
+        assertEquals(1, chat.initiatorServer.outbox.size());
+        assertEquals(original.bytes(), chat.initiatorServer.outbox.get(0).bytes());
+    }
+
+    @Test
+    void nothingIsSentInPlaceOfAMessageTheOutboxNoLongerHas() {
+        // nothing is kept, which is also what a chat looks like after a restart that predates
+        // the outbox, or after enough messages to push the one being asked for out of it
+        var chat = new Chat(0).establish();
+
+        chat.initiator.sendMessage(CHAT_ID, "lost").block();
+        chat.initiator.sendMessage(CHAT_ID, "arrived").block();
+        chat.participantServer.outbox.clear();
+        assertNull(chat.participant.onNewMessage(chat.initiatorServer.outbox.get(1)).blockFirst());
+
+        chat.initiatorServer.outbox.clear();
+        chat.initiator.onNewMessage(chat.participantServer.outbox.get(0)).blockLast();
+
+        // a message standing in for the lost one would have to carry some in_seq_no, and the
+        // current one is ahead of what the held messages carry. A peer which checks that, as
+        // TDLib does when it replays what it was holding, finds every one of them out of order
+        // and discards the chat. Leaving the hole open leaves the chat merely stuck
+        assertTrue(chat.initiatorServer.outbox.isEmpty(),
+                "sent something in place of a message whose in_seq_no is lost with it");
+    }
+
+    @Test
+    void everySentMessageIsOfferedToTheOutbox() {
+        // including the service messages, which take a sequence number like any other and so can
+        // be the one the peer is stuck on
+        var chat = new Chat(4).establish();
+        for (int i = 0; i < 10; i++) {
+            chat.initiator.sendMessage(CHAT_ID, "message " + i).block();
+        }
+
+        var seqNo = chat.initiatorState().seqNo();
+        assertNull(chat.initiatorOutbox.get(CHAT_ID, seqNo.toWireSeqNo(5)).block(),
+                "an old message was kept");
+
+        var newest = chat.initiatorOutbox.get(CHAT_ID, seqNo.toWireSeqNo(seqNo.outSeqNo() - 1)).block();
+        assertNotNull(newest, "the newest was dropped");
+        // the numbers a stand-in would have to copy are kept beside the body, since they cannot
+        // be read back out of it without the key
+        assertEquals(seqNo.toWireSeqNo(seqNo.outSeqNo() - 1), newest.outSeqNo());
+        assertEquals(seqNo.inWireSeqNo(), newest.inSeqNo());
+        assertEquals(SecretChatUtils.LAYER, newest.layer());
+    }
+
+    @Test
+    void aResendRequestNamingMessagesWeNeverSentIsRefused() {
+        var chat = new Chat().establish();
+        chat.initiator.sendMessage(CHAT_ID, "only").block();
+
+        var seqNo = chat.initiatorState().seqNo();
+        chat.initiatorServer.outbox.clear();
+
+        // beyond what we have sent, which no correct peer asks for
+        chat.initiator.onNewMessage(chat.participantSends(ImmutableDecryptedMessageActionResend.of(
+                seqNo.toWireSeqNo(20), seqNo.toWireSeqNo(40)))).blockLast();
+        assertTrue(chat.initiatorServer.outbox.isEmpty(), "answered for messages we never sent");
+
+        // the wrong parity names the participant's own messages, not ours
+        chat.initiator.onNewMessage(chat.participantSends(ImmutableDecryptedMessageActionResend.of(
+                seqNo.toRemoteWireSeqNo(0), seqNo.toRemoteWireSeqNo(0)))).blockLast();
+        assertTrue(chat.initiatorServer.outbox.isEmpty(), "answered a range of the other direction");
+    }
+
+    @Test
+    void aMessageUnderAKeyNobodyHasAnyMoreIsNotSentAgain() {
+        var chat = new Chat().establish();
+        chat.initiator.sendMessage(CHAT_ID, "under the first key").block();
+
+        var seqNo = chat.initiatorState().seqNo();
+        int outSeqNo = seqNo.toWireSeqNo(seqNo.outSeqNo() - 1);
+        chat.settle();
+
+        // each side keeps the current key and the one before it, so after two replacements the
+        // message kept in the outbox is readable to nobody
+        chat.initiator.rekey(CHAT_ID).block();
+        chat.settle();
+        chat.participant.rekey(CHAT_ID).block();
+        chat.settle();
+
+        chat.initiatorServer.outbox.clear();
+        chat.initiator.onNewMessage(chat.participantSends(
+                ImmutableDecryptedMessageActionResend.of(outSeqNo, outSeqNo))).blockLast();
+
+        // it is still in the outbox, but sending it would reach the peer under a key it has
+        // forgotten, which it has no answer to beyond giving up on the chat
+        assertTrue(chat.initiatorServer.outbox.isEmpty(),
+                "sent a message under a key the peer can no longer read");
+    }
+
+    @Test
+    void standingInIsManualAndCopiesTheOldestMessageStillKept() {
+        var chat = new Chat(4).establish();
+        for (int i = 1; i <= 5; i++) {
+            chat.initiator.sendMessage(CHAT_ID, "message " + i).block();
+        }
+
+        // only the last arrives, so the participant holds it and asks for the other four
+        chat.participantServer.outbox.clear();
+        assertNull(chat.participant.onNewMessage(chat.initiatorServer.outbox.get(4)).blockFirst());
+        assertEquals(1, chat.participantServer.outbox.size(), "no resend was requested");
+
+        chat.initiatorServer.outbox.clear();
+        chat.initiator.onNewMessage(chat.participantServer.outbox.get(0)).blockLast();
+        assertEquals(3, chat.initiatorServer.outbox.size(),
+                "answering a resend request sent something for a message it no longer has");
+
+        // the oldest is gone, and nothing is offered in its place until somebody asks for that
+        var seqNo = chat.initiatorState().seqNo();
+        chat.initiator.standInFor(CHAT_ID).block();
+        assertEquals(4, chat.initiatorServer.outbox.size(), "nothing was sent to stand in");
+
+        var oldest = chat.initiatorOutbox.get(CHAT_ID, seqNo.toWireSeqNo(2)).block();
+        assertNotNull(oldest);
+
+        // the numbers are the whole point, and our own side is deliberately not strict enough
+        // about them to notice, so they are read off the message itself
+        var key = chat.participantState().key();
+        assertNotNull(key);
+        var standIn = (DecryptedMessageLayer) new SecretChatCipher(false).decrypt(key,
+                chat.participantState().creator(), chat.initiatorServer.outbox.get(3).bytes().copy());
+        assertEquals(seqNo.toWireSeqNo(1), standIn.outSeqNo(), "stood in for the wrong message");
+        assertEquals(oldest.inSeqNo(), standIn.inSeqNo(),
+                "an in_seq_no of its own, which makes everything the peer holds unacceptable to it");
+        assertEquals(oldest.layer(), standIn.layer(), "a layer of its own, which fails the same way");
+
+        // and the chat moves again, one message the poorer
+        var delivered = new ArrayList<String>();
+        for (var message : List.copyOf(chat.initiatorServer.outbox)) {
+            chat.participant.onNewMessage(message)
+                    .cast(BaseDecryptedMessage.class)
+                    .map(BaseDecryptedMessage::message)
+                    .doOnNext(delivered::add)
+                    .blockLast();
+        }
+        assertEquals(List.of("message 2", "message 3", "message 4", "message 5"), delivered);
+    }
+
+    @Test
+    void standingInAimsAtTheNumberThePeerNamed() {
+        // nothing is kept, so the request cannot be answered and what it named is all we know
+        var chat = new Chat(0).establish();
+        for (int i = 0; i < 3; i++) {
+            chat.initiator.sendMessage(CHAT_ID, "message " + i).block();
+        }
+
+        var seqNo = chat.initiatorState().seqNo();
+        int asked = seqNo.toWireSeqNo(2);
+        chat.initiator.onNewMessage(chat.participantSends(
+                ImmutableDecryptedMessageActionResend.of(asked, asked))).blockLast();
+
+        // what the peer reports having processed puts it somewhere else, and that is the whole
+        // point: clients disagree by one about what that number counts, while a resend request
+        // names the number outright
+        int reported = seqNo.toWireSeqNo(chat.initiatorState().seqNo().remoteInSeqNo());
+        assertNotEquals(asked, reported, "the two sources agree here, so this proves nothing");
+
+        chat.initiatorServer.outbox.clear();
+        chat.initiator.standInFor(CHAT_ID).block();
+        assertEquals(1, chat.initiatorServer.outbox.size());
+
+        var key = chat.participantState().key();
+        assertNotNull(key);
+        var standIn = (DecryptedMessageLayer) new SecretChatCipher(false).decrypt(key,
+                chat.participantState().creator(), chat.initiatorServer.outbox.get(0).bytes().copy());
+        assertEquals(asked, standIn.outSeqNo(), "stood in for a number the peer never asked about");
+    }
+
+    @Test
+    void aStandInCopiesTheNeighbourOfTheHoleAndNothingFurther() {
+        var chat = new Chat().establish();
+        chat.initiator.sendMessage(CHAT_ID, "before the hole").block();
+
+        // the hole itself, kept nowhere, and then several more so that the outbox holds messages
+        // well past it as well as the one right before it
+        var seqNo = chat.initiatorState().seqNo();
+        int hole = seqNo.toWireSeqNo(seqNo.outSeqNo());
+        chat.initiator.stageMessage(CHAT_ID, "lost", false).block();
+        for (int i = 0; i < 3; i++) {
+            chat.initiator.sendMessage(CHAT_ID, "after the hole " + i).block();
+        }
+
+        var before = chat.initiatorOutbox.get(CHAT_ID, hole - 2).block();
+        var after = chat.initiatorOutbox.get(CHAT_ID, hole + 2).block();
+        assertNotNull(before);
+        assertNotNull(after);
+
+        chat.initiatorServer.outbox.clear();
+        chat.initiator.standInFor(CHAT_ID, hole).block();
+        assertEquals(1, chat.initiatorServer.outbox.size());
+
+        var key = chat.participantState().key();
+        assertNotNull(key);
+        var standIn = (DecryptedMessageLayer) new SecretChatCipher(false).decrypt(key,
+                chat.participantState().creator(), chat.initiatorServer.outbox.get(0).bytes().copy());
+
+        // the one before the hole is what the peer recorded as it processed it, so repeating it is
+        // accepted as equal and leaves everything held behind the hole acceptable too
+        assertEquals(hole, standIn.outSeqNo());
+        assertEquals(before.inSeqNo(), standIn.inSeqNo(), "took its numbers from somewhere else");
+        assertEquals(before.layer(), standIn.layer());
+        assertTrue(standIn.inSeqNo() <= after.inSeqNo(),
+                "carries more than the messages the peer is holding, which is fatal to it");
+    }
+
+    @Test
+    void standingInWithNothingKeptFallsBackToTheChatsOwnNumbers() {
+        var chat = new Chat(0).establish();
+        chat.initiator.sendMessage(CHAT_ID, "lost").block();
+        chat.initiator.sendMessage(CHAT_ID, "held").block();
+        chat.participant.onNewMessage(chat.initiatorServer.outbox.get(1)).blockFirst();
+
+        var seqNo = chat.initiatorState().seqNo();
+        chat.initiatorServer.outbox.clear();
+        chat.initiator.standInFor(CHAT_ID).block();
+        assertEquals(1, chat.initiatorServer.outbox.size());
+
+        var key = chat.participantState().key();
+        assertNotNull(key);
+        var standIn = (DecryptedMessageLayer) new SecretChatCipher(false).decrypt(key,
+                chat.participantState().creator(), chat.initiatorServer.outbox.get(0).bytes().copy());
+
+        // the worst guess there is, and the one that ends the chat when the peer is holding
+        // anything at all behind the hole. It is offered because nothing else is left
+        assertEquals(seqNo.toWireSeqNo(seqNo.remoteInSeqNo()), standIn.outSeqNo());
+        assertEquals(seqNo.inWireSeqNo(), standIn.inSeqNo());
+    }
+
+    @Test
+    void onlyWhatTheOutboxStillHasIsSentAgain() {
+        var chat = new Chat(4).establish();
+        for (int i = 0; i < 10; i++) {
+            chat.initiator.sendMessage(CHAT_ID, "message " + i).block();
+        }
+
+        var seqNo = chat.initiatorState().seqNo();
+        int last = seqNo.outSeqNo() - 1;
+
+        // the newest four, all of which are still kept
+        chat.initiatorServer.outbox.clear();
+        chat.initiator.onNewMessage(chat.participantSends(ImmutableDecryptedMessageActionResend.of(
+                seqNo.toWireSeqNo(last - 3), seqNo.toWireSeqNo(last)))).blockLast();
+        assertEquals(4, chat.initiatorServer.outbox.size());
+
+        // and a range beginning before what is kept, which is the shape that matters: the peer is
+        // stopped on the oldest number it names, and that is the one that fell out of the outbox
+        chat.initiatorServer.outbox.clear();
+        chat.initiator.onNewMessage(chat.participantSends(ImmutableDecryptedMessageActionResend.of(
+                seqNo.toWireSeqNo(0), seqNo.toWireSeqNo(3)))).blockLast();
+        assertTrue(chat.initiatorServer.outbox.isEmpty(), "answered with something it never sent");
+    }
+
+    @Test
+    void aPeerStuckBehindAHoleCanBeGivenEverythingAgain() {
+        var chat = new Chat().establish();
+
+        // the participant never gets the first, so it holds the rest and stops confirming
+        chat.initiator.sendMessage(CHAT_ID, "lost").block();
+        chat.initiator.sendMessage(CHAT_ID, "held").block();
+        chat.participant.onNewMessage(chat.initiatorServer.outbox.get(1)).blockFirst();
+
+        // the only sign on our side is the peer's own count standing still
+        var stuck = chat.initiatorState().seqNo();
+        assertTrue(stuck.remoteInSeqNo() < stuck.outSeqNo(),
+                "the peer confirmed everything, so there is nothing to recover from");
+
+        chat.initiatorServer.outbox.clear();
+        chat.participantServer.outbox.clear();
+        chat.initiator.resendUnconfirmed(CHAT_ID).block();
+        assertEquals(stuck.outSeqNo() - stuck.remoteInSeqNo(), chat.initiatorServer.outbox.size(),
+                "sent back less than the peer is missing");
+
+        var delivered = new ArrayList<String>();
+        for (var message : List.copyOf(chat.initiatorServer.outbox)) {
+            chat.participant.onNewMessage(message)
+                    .cast(BaseDecryptedMessage.class)
+                    .map(BaseDecryptedMessage::message)
+                    .doOnNext(delivered::add)
+                    .blockLast();
+        }
+        assertEquals(List.of("lost", "held"), delivered);
+    }
+
+    @Test
     void rekeyingLeavesBothSidesOnTheSameNewKey() {
         var chat = new Chat().establish();
         var before = chat.initiatorState();
@@ -520,7 +903,7 @@ class SecretChatManagerTest {
 
         // the key is good for a hundred messages, and nothing outside the manager is expected
         // to count them
-        for (int i = 0; i < SecretChatState.DEFAULT_MESSAGES_PER_KEY; i++) {
+        for (int i = 0; i < SecretChatUtils.DEFAULT_MESSAGES_PER_KEY; i++) {
             chat.participant.sendMessage(CHAT_ID, "message " + i).block();
             chat.settle();
         }
@@ -547,7 +930,7 @@ class SecretChatManagerTest {
 
         // only the initiator ever speaks, so a check that runs only on incoming messages would
         // never fire
-        for (int i = 0; i < SecretChatState.DEFAULT_MESSAGES_PER_KEY; i++) {
+        for (int i = 0; i < SecretChatUtils.DEFAULT_MESSAGES_PER_KEY; i++) {
             chat.initiator.sendMessage(CHAT_ID, "message " + i).block();
             chat.settle();
         }
