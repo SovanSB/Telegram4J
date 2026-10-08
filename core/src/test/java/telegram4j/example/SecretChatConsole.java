@@ -199,7 +199,8 @@ public final class SecretChatConsole {
     static final String HELP = """
             commands:
               /chats                 what secret chats exist and where their counters are
-              /newchat <@username>   ask a user for a secret chat
+              /newchat <who>         ask a user for a secret chat: @username, or
+                                     a phone number as +XXXXXXXXXXX
               /send <chatId> <text>  send into a secret chat
               /rekey <chatId>        replace the key of a secret chat now
               /discard <chatId>      tear a secret chat down and forget its key
@@ -555,11 +556,9 @@ public final class SecretChatConsole {
                     .then();
             case "/newchat" -> {
                 if (parts.length < 2) {
-                    yield Mono.fromRunnable(() -> log("usage: /newchat <@username>"));
+                    yield Mono.fromRunnable(() -> log("usage: /newchat <@username|+phone>"));
                 }
-                yield client.resolvePeer(PeerId.of(parts[1]))
-                    .switchIfEmpty(Mono.error(new IllegalArgumentException("no such user: " + parts[1])))
-                    .flatMap(peer -> client.asInputUserExact(peer.getId()))
+                yield resolveUser(client, parts[1])
                     .flatMap(secretChats::requestSecretChat)
                     .doOnNext(state -> log("requested secret chat " + state.id()
                             + " with " + state.peerId() + ", waiting for it to be accepted"))
@@ -628,6 +627,37 @@ public final class SecretChatConsole {
             }
             default -> Mono.fromRunnable(() -> log("unknown command: " + parts[0] + ", try /help"));
         };
+    }
+
+    /**
+     * {@return The user that a {@code /newchat} argument names}
+     *
+     * <p>A leading {@code +} marks a phone number, resolved with {@code contacts.resolvePhone}.
+     * That answers only for a number whose owner can be found that way — we are in their
+     * contacts, or their privacy settings allow it — and it adds nobody to our own contacts.
+     * A number nobody can be found by fails with {@code PHONE_NOT_OCCUPIED}, which says nothing
+     * about whether the number exists. Anything else is taken for a username.
+     */
+    static Mono<InputUser> resolveUser(MTProtoTelegramClient client, String who) {
+        if (!who.startsWith("+")) {
+            return client.resolvePeer(PeerId.of(who))
+                    .switchIfEmpty(Mono.error(new IllegalArgumentException("no such user: " + who)))
+                    .flatMap(peer -> client.asInputUserExact(peer.getId()));
+        }
+
+        // digits only, which is the form the API takes, and it lets the number be typed with
+        // whatever punctuation it is usually written with
+        return client.getServiceHolder().getUserService().resolvePhone(who.replaceAll("\\D", ""))
+                .flatMap(resolved -> resolved.users().stream()
+                        .filter(BaseUser.class::isInstance)
+                        .map(BaseUser.class::cast)
+                        .findFirst()
+                        // the answer carries the user in full, access hash included, so there is
+                        // nothing left to look up in the store
+                        .map(user -> Mono.<InputUser>just(ImmutableBaseInputUser.of(user.id(),
+                                Objects.requireNonNullElse(user.accessHash(), 0L))))
+                        .orElseGet(() -> Mono.error(new IllegalArgumentException(
+                                "no user came back for " + who))));
     }
 
     static Mono<String> describePeer(MTProtoTelegramClient client, long peerId) {
