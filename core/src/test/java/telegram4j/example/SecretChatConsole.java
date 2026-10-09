@@ -93,6 +93,12 @@ import java.util.StringJoiner;
  * other Telegram account data, there is no server-side copy of this file. If you lose it, the
  * conversations become unrecoverable; if you share it, they become readable.
  * It is covered by {@code .gitignore}.
+ *
+ * <h2>Notes</h2>
+ *
+ * Chat creation and message sending have been tested on both Android and iPhone using the
+ * official applications. Support for MadelineProto is implemented but untested — it is
+ * expected to work with {@code accept.legacy.mtproto=true}, but this has not been confirmed.
  */
 public final class SecretChatConsole {
 
